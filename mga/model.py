@@ -18,14 +18,30 @@ v0.1 additions:
 - posxattn: block-local RoPE on Pool keys; Read q at token index, k at
   cover_end -- the q.k dot product then directly encodes token distance
 - full baseline uses SDPA is_causal (flash path on CUDA, no big mask)
+
+CUDA note: folded-block batches can reach bs*nfull = 65536 rows, which
+exceeds the CUDA grid y-limit (65535) hit by some SDPA backends. Folded
+self-attention is therefore chunked to 8192 rows per call, and CrossAttn
+uses manual matmul attention (its matrices are small anyway).
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+FOLD_CHUNK = 8192  # max folded-block rows per attention call (grid y-limit)
+
 
 def causal_mask(t, device):
     return torch.tril(torch.ones(t, t, dtype=torch.bool, device=device))
+
+
+def run_chunked(fn, x, chunk=FOLD_CHUNK):
+    """Apply fn (batch-first) to x in row chunks; keeps CUDA grid dims safe."""
+    if x.shape[0] <= chunk:
+        return fn(x)
+    return torch.cat([fn(xi) for xi in x.split(chunk, dim=0)], dim=0)
 
 
 class RoPE(nn.Module):
@@ -88,8 +104,9 @@ class Block(nn.Module):
 
 
 class CrossAttn(nn.Module):
-    """Multi-head cross-attention. By default keys/values carry no positional
-    encoding; pass rope + positions to make order/distance explicit."""
+    """Multi-head cross-attention, manual matmul attention (small matrices;
+    avoids SDPA backend quirks and folded-batch grid limits). Keys/values
+    carry no positional encoding unless rope + positions are passed."""
 
     def __init__(self, d, h):
         super().__init__()
@@ -101,16 +118,20 @@ class CrossAttn(nn.Module):
     def forward(self, xq, xkv, mask=None, rope=None, q_pos=None, k_pos=None):
         b, tq, c = xq.shape
         tk = xkv.shape[1]
-        q = self.wq(xq).view(b, tq, self.h, -1).transpose(1, 2)
+        hd = c // self.h
+        q = self.wq(xq).view(b, tq, self.h, hd).transpose(1, 2)
         k, v = self.wkv(xkv).chunk(2, dim=-1)
-        k = k.view(b, tk, self.h, -1).transpose(1, 2)
-        v = v.view(b, tk, self.h, -1).transpose(1, 2)
+        k = k.view(b, tk, self.h, hd).transpose(1, 2)
+        v = v.view(b, tk, self.h, hd).transpose(1, 2)
         if rope is not None:
             if q_pos is not None:
                 q = rope.rotate(q, q_pos)
             if k_pos is not None:
                 k = rope.rotate(k, k_pos)
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(hd)
+        if mask is not None:
+            scores = scores.masked_fill(~mask, float("-inf"))
+        o = torch.softmax(scores, dim=-1) @ v
         return self.out(o.transpose(1, 2).reshape(b, tq, c))
 
 
@@ -131,7 +152,8 @@ class Pool(nn.Module):
         # x: (B', t, c) -> (B', kq, c)
         q = self.queries.unsqueeze(0).expand(x.shape[0], -1, -1)
         k_pos = torch.arange(x.shape[1], device=x.device) if rope is not None else None
-        return self.xattn(q, self.ln(x), rope=rope, k_pos=k_pos)
+        return run_chunked(lambda xi: self.xattn(
+            q[: xi.shape[0]], self.ln(xi), rope=rope, k_pos=k_pos), x)
 
     def forward(self, x, b, rope=None, shift=0):
         """Returns (summaries (bs, ns, c), cover_end (ns,) long)."""
@@ -224,9 +246,8 @@ class MGAModel(nn.Module):
         return self.mods[name]
 
     def _apply_block(self, blk, s, shift=0):
-        """Block-causal smoothing. Full blocks fold into batch; head/tail
-        partial segments (from shift or non-divisible lengths) are processed
-        as their own small blocks -- same causal-within-segment semantics."""
+        """Block-causal smoothing. Full blocks fold into batch (chunked);
+        head/tail partial segments processed as their own small blocks."""
         bs, t, c = s.shape
         b = self.b
         if t <= b:
@@ -237,7 +258,9 @@ class MGAModel(nn.Module):
         nfull = (t - shift) // b
         if nfull:
             xb = s[:, shift:shift + nfull * b].reshape(bs * nfull, b, c)
-            parts.append(blk(xb, causal_mask(b, s.device)).reshape(bs, nfull * b, c))
+            mask = causal_mask(b, s.device)
+            parts.append(run_chunked(lambda xi: blk(xi, mask), xb)
+                         .reshape(bs, nfull * b, c))
         rem = t - shift - nfull * b
         if rem:
             parts.append(blk(s[:, t - rem:], causal_mask(rem, s.device)))
@@ -299,6 +322,6 @@ class BaselineModel(nn.Module):
             xb = x.reshape(bs * (t // w), w, -1)
             mask = causal_mask(w, dev)
             for blk in self.blocks:
-                xb = blk(xb, mask)
+                xb = run_chunked(lambda xi: blk(xi, mask), xb)
             x = xb.reshape(bs, t, -1)
         return self.head(self.lnf(x))
