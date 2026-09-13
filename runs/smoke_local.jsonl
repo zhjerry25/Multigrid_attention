@@ -1,0 +1,12 @@
+{"step": 0, "loss": 3.7003, "digit_acc": 0.0188, "exact": 0.0, "sec": 1.1}
+{"step": 0, "eval_exact": 0.0, "eval_digit": 0.0047}
+{"step": 100, "loss": 2.36, "digit_acc": 0.0375, "exact": 0.0, "sec": 96.3}
+{"step": 200, "loss": 2.3249, "digit_acc": 0.0688, "exact": 0.0, "sec": 193.4}
+{"step": 300, "loss": 2.3307, "digit_acc": 0.0875, "exact": 0.0, "sec": 278.6}
+{"step": 400, "loss": 2.3045, "digit_acc": 0.1063, "exact": 0.0, "sec": 346.2}
+{"step": 500, "loss": 2.3334, "digit_acc": 0.1063, "exact": 0.0, "sec": 416.8}
+{"step": 500, "eval_exact": 0.0, "eval_digit": 0.0953}
+{"step": 600, "loss": 2.2988, "digit_acc": 0.15, "exact": 0.0, "sec": 505.7}
+{"step": 700, "loss": 2.305, "digit_acc": 0.1, "exact": 0.0, "sec": 588.2}
+{"step": 800, "loss": 2.3039, "digit_acc": 0.0938, "exact": 0.0, "sec": 673.0}
+{"step": 900, "loss": 2.2987, "digit_acc": 0.1187, "exact": 0.0, "sec": 752.6}
