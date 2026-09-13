@@ -100,15 +100,20 @@ $$\\sum_\\ell \\frac{n \\cdot b \\cdot d}{b^\\ell} = O(n \\cdot b \\cdot d)$$
 - **"注意力不平滑"定论**：multigrid 对本工作只是图结构蓝图（直径定理可证），平滑性分析不成立也不追求——语言依赖本来就是尖峰的，要的是路由不是扩散。
 - **read 成本诚实账**：v0 的 read 是 O(n²/b²)，**不是线性**。100k+ 声明前必须换线性变体（root-path 或 top-k 摘要选择）。
 
-## v0.1 设计清单（按优先级，第二轮修订）
+## v0.1 设计清单（已全部实现 ✅，2026-09-13 第三轮）
 
-1. **per-cycle 出口损失**：每个 cycle 的 level-0 出口接同一个 tied head 算 CE，L = Σ_t w_t·L_t，w_t 递增（如 0.3/0.7/1.0）——pool 梯度路径减半，专治鸡生蛋；顺带白拿 loss-vs-T 收敛曲线（H1 的图）。
-2. **长度课程**：128→512→4096 逐段训练。共享权重使"加长上下文"="复用同一算子、树多长一层"，零架构改动；顺带预演 H2 外推实验。
-3. **每角色 LayerNorm**（`--roleln`）：smooth/pool/read/post/top 各一份 LN 仿射参数，消除跨角色梯度干扰，保留 ~99% 权重共享。
-4. **线性 read 变体**（root-path 或 top-k 摘要选择）——严格线性复杂度的本体，大 n 声明的前置条件。
-5. **shifted blocking**：跨 cycle 错开 b/2 分块边界，白拿"任意 token 对总在某轮同块"。
-6. **k>1 带宽消融**（接口已留，优先级最低——已确认非主瓶颈）。
-7. **仪表**：表示收缩率 ‖s_{t+1}−s_t‖/‖s_t‖ 随 cycle 的变化。
+1. **per-cycle 出口损失** ✅（`--exitloss`，w_t 递增 0.3→1.0；eval 自动记录 cycles_exact = H1 收敛曲线）。
+2. **长度课程** ✅（`--curr 512,1024,2048,4096`，前半训练变长采样；纯数据侧，共享权重天然支持）。
+3. **Pool/Read 位置编码** ✅（`--posxattn`；Read 的 q 在 token index、k 在 cover_end 旋转——q·k 直接编码精确距离）。
+4. **kq>1 带宽** ✅（`--k`，要求 kq | b；Read 掩码按 cover_end 泛化）。
+5. **shifted blocking** ✅（`--shift`，奇数 cycle 偏移 b/2；head/mid/tail 分段保证部分块因果干净；泄漏测试覆盖）。
+6. **每角色 LayerNorm**（`--roleln`）：未做，训练不稳时再加。
+7. **线性 read 变体**：未做，>16k 实验的前置条件；当前 read 为 O(n²/b²)（诚实账）。
+
+评测套（`mga/data.py`）：passkey（含 depth_exact 深度分桶 = needle×T 指纹图数据）、copying、**MQAR**（16 对 key→value 干扰中的内容寻址，注意：filler 词表改为 18-29，10-17 保留为 MQAR keys，与旧 512 运行不严格可比）。
+基线：full（`is_causal` flash 路径，4096 在真卡可跑）、local（感受野=窗口，深度不变）。
+训练配置（真卡）：bs 256 + lr 2e-3 + steps 4000 + bf16 + EMA 0.999 + ckpt 周期保存。
+多卡：`sweep.sh`——每配置独占一卡、自动排队，12 个 job（T×kq 主矩阵 + full/local + mqar/copying 泛化），`bash sweep.sh` 一键。
 
 ## v0.2 旗舰机制：AMR（自适应网格加密）
 

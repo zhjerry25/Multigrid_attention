@@ -1,18 +1,23 @@
-"""MGA v0: causal multigrid V-cycle transformer, plus full/local baselines.
+"""MGA v0.1: causal multigrid V-cycle transformer, plus full/local baselines.
 
 One V-cycle = bottom-up smoothing + learned pooling (restriction),
 full-causal solve at the top level, then top-down cross-attention read
 (prolongation) + post-smoothing. The same operator (Block/Pool/Read) is
 shared across all levels and all cycles unless `shared=False`.
 
-Causality rule: the summary of block j covers tokens [j*b, (j+1)*b) and may
-only be read by tokens in blocks with index > j (strictly past). A learned
-null key/value is always readable so early blocks have a well-defined read.
+Causality rule: a summary may be read by token i only if every token it
+covers is < i. Tracked explicitly via cover_end per summary (one past the
+last covered position, in that level's coordinates), which also makes
+shifted partitions and partial blocks sound.
 
-posxattn=True adds explicit position to the cross-attention paths (v0.1):
-block-local RoPE on Pool keys and block-index RoPE on Read queries/keys, so
-order and distance are directly representable instead of being smuggled
-inside token content.
+v0.1 additions:
+- kq > 1 summaries per block (bandwidth knob; requires b % kq == 0)
+- shifted blocking: odd cycles offset the level-0 partition by b//2 so any
+  token pair is co-blocked in some cycle (head/mid/tail segmentation keeps
+  partial blocks causal-clean)
+- posxattn: block-local RoPE on Pool keys; Read q at token index, k at
+  cover_end -- the q.k dot product then directly encodes token distance
+- full baseline uses SDPA is_causal (flash path on CUDA, no big mask)
 """
 import torch
 import torch.nn as nn
@@ -59,7 +64,10 @@ class Attn(nn.Module):
         k = k.view(b, t, self.h, -1).transpose(1, 2)
         v = v.view(b, t, self.h, -1).transpose(1, 2)
         q, k = self.rope.apply(q, k)
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        if mask is None:  # full causal: flash/mem-efficient path on CUDA
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.out(o.transpose(1, 2).reshape(b, t, c))
 
 
@@ -107,9 +115,10 @@ class CrossAttn(nn.Module):
 
 
 class Pool(nn.Module):
-    """Restriction: kq learned queries cross-attend to each block (full within
-    block -- the summary is only ever read after the block ends, so no leak).
-    With rope, keys get block-local positions so order is addressable."""
+    """Restriction: kq learned queries cross-attend to each segment (full
+    attention within the segment -- summaries are only read after the segment
+    ends, so no leak). Handles partial head/tail segments from shifts and
+    non-divisible lengths."""
 
     def __init__(self, d, h, kq=1):
         super().__init__()
@@ -118,21 +127,39 @@ class Pool(nn.Module):
         self.ln = nn.LayerNorm(d)
         self.xattn = CrossAttn(d, h)
 
-    def forward(self, x, b, rope=None):
+    def _pool_seg(self, x, rope):
+        # x: (B', t, c) -> (B', kq, c)
+        q = self.queries.unsqueeze(0).expand(x.shape[0], -1, -1)
+        k_pos = torch.arange(x.shape[1], device=x.device) if rope is not None else None
+        return self.xattn(q, self.ln(x), rope=rope, k_pos=k_pos)
+
+    def forward(self, x, b, rope=None, shift=0):
+        """Returns (summaries (bs, ns, c), cover_end (ns,) long)."""
         bs, t, c = x.shape
-        nb = t // b
-        xb = self.ln(x).reshape(bs * nb, b, c)
-        q = self.queries.unsqueeze(0).expand(bs * nb, -1, -1)
-        k_pos = torch.arange(b, device=x.device) if rope is not None else None
-        o = self.xattn(q, xb, rope=rope, k_pos=k_pos)
-        return o.reshape(bs, nb * self.kq, c)
+        parts, ends = [], []
+        if shift > 0:
+            parts.append(self._pool_seg(x[:, :shift], rope))
+            ends.append(shift)
+        nfull = (t - shift) // b
+        if nfull:
+            mid = x[:, shift:shift + nfull * b].reshape(bs * nfull, b, c)
+            o = self._pool_seg(mid, rope)
+            parts.append(o.reshape(bs, nfull * self.kq, c))
+            ends.extend(shift + (j + 1) * b for j in range(nfull))
+        rem = t - shift - nfull * b
+        if rem:
+            parts.append(self._pool_seg(x[:, t - rem:], rope))
+            ends.append(t)
+        s = torch.cat(parts, dim=1)
+        cover_end = torch.tensor(ends, device=x.device).repeat_interleave(self.kq)
+        return s, cover_end
 
 
 class Read(nn.Module):
-    """Prolongation: tokens cross-attend to summaries of strictly-past blocks
-    (plus an always-visible learned null token). Residual, pre-norm. With
-    rope, queries rotate by own block index and keys by summary block index,
-    so relative block distance is explicit."""
+    """Prolongation: tokens cross-attend to summaries with cover_end <= their
+    position (strictly past coverage), plus an always-visible learned null
+    token. Residual, pre-norm. With rope: queries rotate at token index,
+    keys at cover_end -- the dot product encodes exact distance."""
 
     def __init__(self, d, h):
         super().__init__()
@@ -140,38 +167,36 @@ class Read(nn.Module):
         self.xattn = CrossAttn(d, h)
         self.null = nn.Parameter(torch.randn(1, 1, d) * 0.02)
 
-    def forward(self, x, summaries, b, rope=None):
+    def forward(self, x, summaries, cover_end, rope=None):
         bs, t, c = x.shape
         ns = summaries.shape[1]
         kv = torch.cat([self.null.expand(bs, 1, c), summaries], dim=1)
         i = torch.arange(t, device=x.device).unsqueeze(1)
-        js = torch.arange(ns, device=x.device).unsqueeze(0)
+        allowed = cover_end.unsqueeze(0) <= i  # (t, ns)
         mask = torch.cat(
-            [torch.ones(t, 1, dtype=torch.bool, device=x.device), js < (i // b)],
-            dim=1,
+            [torch.ones(t, 1, dtype=torch.bool, device=x.device), allowed], dim=1
         )
         q_pos = k_pos = None
         if rope is not None:
-            q_pos = torch.arange(t, device=x.device) // b
+            q_pos = torch.arange(t, device=x.device)
             k_pos = torch.cat(
-                [torch.zeros(1, dtype=torch.long, device=x.device),
-                 torch.arange(ns, device=x.device)]
+                [torch.zeros(1, dtype=torch.long, device=x.device), cover_end]
             )
         return x + self.xattn(self.ln(x), kv, mask, rope=rope, q_pos=q_pos, k_pos=k_pos)
 
 
 class MGAModel(nn.Module):
     def __init__(self, vocab, n, d=256, h=4, b=16, kq=1, cycles=2, shared=True,
-                 posxattn=False):
+                 posxattn=False, shift=False):
         super().__init__()
-        assert kq == 1, "v0 supports kq=1 only (bandwidth knob is v0.1)"
+        assert b % kq == 0, "kq must divide b"
         m, n_levels = n, 0
         while m > b:
             assert m % b == 0, f"sequence length {n} not coarsenable by b={b}"
-            m //= b
+            m = m * kq // b
             n_levels += 1
-        self.b, self.cycles, self.shared = b, cycles, shared
-        self.posxattn = posxattn
+        self.b, self.kq, self.cycles, self.shared = b, kq, cycles, shared
+        self.posxattn, self.shift = posxattn, (b // 2 if shift else 0)
         self.emb = nn.Embedding(vocab, d)
         nn.init.normal_(self.emb.weight, std=0.02)
         self.head = nn.Linear(d, vocab, bias=False)
@@ -198,48 +223,57 @@ class MGAModel(nn.Module):
                     "pool": self.pool, "read": self.read}[name.split("_")[0]]
         return self.mods[name]
 
-    def _apply_block(self, blk, s):
-        """Block-causal smoothing, computed by folding blocks into the batch
-        dimension (avoids materializing a huge masked attention matrix)."""
+    def _apply_block(self, blk, s, shift=0):
+        """Block-causal smoothing. Full blocks fold into batch; head/tail
+        partial segments (from shift or non-divisible lengths) are processed
+        as their own small blocks -- same causal-within-segment semantics."""
         bs, t, c = s.shape
         b = self.b
         if t <= b:
-            return blk(s, causal_mask(t, s.device))
-        xb = s.reshape(bs * (t // b), b, c)
-        return blk(xb, causal_mask(b, s.device)).reshape(bs, t, c)
+            return blk(s, None)
+        parts = []
+        if shift > 0:
+            parts.append(blk(s[:, :shift], causal_mask(shift, s.device)))
+        nfull = (t - shift) // b
+        if nfull:
+            xb = s[:, shift:shift + nfull * b].reshape(bs * nfull, b, c)
+            parts.append(blk(xb, causal_mask(b, s.device)).reshape(bs, nfull * b, c))
+        rem = t - shift - nfull * b
+        if rem:
+            parts.append(blk(s[:, t - rem:], causal_mask(rem, s.device)))
+        return torch.cat(parts, dim=1)
 
-    def _vcycle(self, s0):
+    def _vcycle(self, s0, shift=0):
         b = self.b
         rope = self.rope if self.posxattn else None
-        hier = [s0]
+        hier, covers = [s0], []
         s, l = s0, 0
         while s.shape[1] > b:
-            s = self._apply_block(self._get(f"smooth_{l}"), s)
-            s = self._get(f"pool_{l}")(s, b, rope=rope)
+            sh = shift if l == 0 else 0
+            s = self._apply_block(self._get(f"smooth_{l}"), s, sh)
+            s, cover_end = self._get(f"pool_{l}")(s, b, rope=rope, shift=sh)
             hier.append(s)
+            covers.append(cover_end)
             l += 1
-        hier[-1] = self._apply_block(self._get("top"), hier[-1])
+        hier[-1] = self._get("top")(hier[-1], None)
         for l in reversed(range(len(hier) - 1)):
-            hier[l] = self._get(f"read_{l}")(hier[l], hier[l + 1], b, rope=rope)
-            hier[l] = self._apply_block(self._get(f"post_{l}"), hier[l])
+            hier[l] = self._get(f"read_{l}")(hier[l], hier[l + 1], covers[l], rope=rope)
+            hier[l] = self._apply_block(self._get(f"post_{l}"), hier[l],
+                                        shift if l == 0 else 0)
         return hier[0]
 
     def forward(self, idx, all_cycles=False):
         s = self.emb(idx)
-        if all_cycles:
-            outs = []
-            for _ in range(self.cycles):
-                s = self._vcycle(s)
-                outs.append(self.head(self.lnf(s)))
-            return outs
-        for _ in range(self.cycles):
-            s = self._vcycle(s)
-        return self.head(self.lnf(s))
+        outs = []
+        for t in range(self.cycles):
+            s = self._vcycle(s, shift=self.shift if t % 2 == 1 else 0)
+            outs.append(self.head(self.lnf(s)))
+        return outs if all_cycles else outs[-1]
 
 
 class BaselineModel(nn.Module):
-    """Full-causal transformer, or block-local stack (receptive field = window,
-    invariant to depth) as the local-only baseline. Same Block throughout."""
+    """Full-causal transformer (flash path), or block-local stack (receptive
+    field = window, invariant to depth) as the local-only baseline."""
 
     def __init__(self, vocab, n, mode, d=256, h=4, depth=8, window=16):
         super().__init__()
@@ -258,9 +292,8 @@ class BaselineModel(nn.Module):
         dev = idx.device
         x = self.emb(idx)
         if self.mode == "full":
-            mask = causal_mask(t, dev)
             for blk in self.blocks:
-                x = blk(x, mask)
+                x = blk(x, None)  # is_causal inside Attn
         else:
             w = self.window
             xb = x.reshape(bs * (t // w), w, -1)
