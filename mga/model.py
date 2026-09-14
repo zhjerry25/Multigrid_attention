@@ -340,10 +340,84 @@ class AMRRead(nn.Module):
         return x + self.fine.out(ctx + fctx)
 
 
+class SparseRead(nn.Module):
+    """Prolongation (sparse): block-shared global top-m summary selection +
+    top-mf fine fanout. Selection is global and recomputed every step (free
+    exploration, MoBA-style); only the read is sparse -> O(n*m + n*mf*b).
+    Falls back to the dense Read as m -> n/b. Causality: a block's candidate
+    summaries must satisfy cover_end <= block start (same rule as dense)."""
+
+    def __init__(self, d, h, m=64, mf=4):
+        super().__init__()
+        self.h, self.m, self.mf = h, m, mf
+        self.ln = nn.LayerNorm(d)
+        self.scorer = CrossAttn(d, h)
+        self.fine = CrossAttn(d, h)
+        self.null = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+
+    def forward(self, x, summaries, cover_end):
+        bs, n, d = x.shape
+        ns = summaries.shape[1]
+        b = n // ns  # block factor (level-0 block size)
+        nb = ns
+        # keys/values: null + summaries, block-representative scores
+        kv = torch.cat([self.null.expand(bs, 1, d), summaries], dim=1)
+        K, V = self.scorer.wkv(kv).chunk(2, dim=-1)  # (bs, ns+1, d)
+        q = self.scorer.wq(self.ln(x))  # (bs, n, d)
+        qblk = q.view(bs, nb, b, d).mean(dim=2)  # (bs, nb, d) block rep
+        # causal selection: block j's selection is computed from block j-1's
+        # mean query (all <= j*b <= i). A within-block mean would leak future
+        # tokens' queries into earlier tokens' key selection.
+        qrep = torch.cat([qblk[:, :1], qblk[:, :-1]], dim=1)
+        scores = qrep @ K.transpose(-2, -1) / math.sqrt(d)  # (bs, nb, ns+1)
+        j = torch.arange(nb, device=x.device).unsqueeze(1)
+        allowed = torch.cat(
+            [torch.ones(nb, 1, dtype=torch.bool, device=x.device),
+             cover_end.unsqueeze(0) <= (j * b)], dim=1)  # (nb, ns+1)
+        scores = scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+        m = min(self.m, ns + 1)
+        idx = scores.topk(m, dim=-1).indices  # (bs, nb, m), sorted desc
+        valid = allowed.unsqueeze(0).expand(bs, -1, -1).gather(-1, idx)  # (bs,nb,m)
+        # gather selected keys/values, block-wise attention (no per-token
+        # materialization)
+        gK = K[torch.arange(bs).view(bs, 1, 1), idx]  # (bs, nb, m, d)
+        gV = V[torch.arange(bs).view(bs, 1, 1), idx]
+        hd = d // self.h
+        qt = q.view(bs, nb, b, self.h, hd)
+        gKh = gK.view(bs, nb, m, self.h, hd)
+        gVh = gV.view(bs, nb, m, self.h, hd)
+        att = torch.einsum("bqzhd,bqmhd->bqhzm", qt, gKh) / math.sqrt(hd)
+        att = att.masked_fill(~valid.unsqueeze(2).unsqueeze(2), float("-inf"))
+        w = torch.softmax(att, dim=-1)
+        ctx = torch.einsum("bqhzm,bqmhd->bqzhd", w, gVh).reshape(bs, n, d)
+        # fine fanout: top-mf of the selection expand to their raw blocks.
+        # block_map: 0 = null block, 1+g = raw block g (matches idx: 0=null,
+        # s>=1 -> block s-1)
+        mf = min(self.mf, m)
+        fidx = idx[:, :, :mf]  # (bs, nb, mf)
+        fvalid = valid[:, :, :mf]  # blocks with <mf valid past summaries
+        # may have selected masked (invalid) entries whose raw blocks could be
+        # future blocks -- mask them out of the fine attention
+        fmask = fvalid.unsqueeze(-1).expand(-1, -1, -1, b).reshape(bs, nb, mf * b)
+        block_map = torch.cat([self.null.expand(bs, b, d).unsqueeze(1),
+                               x.view(bs, nb, b, d)], dim=1)
+        fkeys = block_map[torch.arange(bs).view(bs, 1, 1), fidx]  # (bs,nb,mf,b,d)
+        fkeys = fkeys.reshape(bs, nb, mf * b, d)
+        fK, fV = self.fine.wkv(fkeys).chunk(2, dim=-1)
+        fKh = fK.view(bs, nb, mf * b, self.h, hd)
+        fVh = fV.view(bs, nb, mf * b, self.h, hd)
+        qf = self.fine.wq(self.ln(x)).view(bs, nb, b, self.h, hd)
+        fatt = torch.einsum("bqzhd,bqmhd->bqhzm", qf, fKh) / math.sqrt(hd)
+        fatt = fatt.masked_fill(~fmask.unsqueeze(2).unsqueeze(2), float("-inf"))
+        fw = torch.softmax(fatt, dim=-1)
+        fctx = torch.einsum("bqhzm,bqmhd->bqzhd", fw, fVh).reshape(bs, n, d)
+        return x + self.fine.out(ctx + fctx)
+
+
 class MGAModel(nn.Module):
     def __init__(self, vocab, n, d=256, h=4, b=16, kq=1, cycles=2, shared=True,
                  posxattn=False, shift=False, fp32read=False, poolaux=False,
-                 read_mode="dense", amr_m=4):
+                 read_mode="dense", amr_m=4, read_m=64, read_mf=4):
         super().__init__()
         assert b % kq == 0, "kq must divide b"
         if read_mode == "amr":
@@ -369,6 +443,8 @@ class MGAModel(nn.Module):
             self.poolaux_head = nn.Linear(d, vocab)
         if read_mode == "amr":
             self.amrread = AMRRead(d, h, m=amr_m)
+        elif read_mode == "sparse":
+            self.sparseread = SparseRead(d, h, m=read_m, mf=read_mf)
         if shared:
             self.block = Block(d, h, self.rope)
             self.pool = Pool(d, h, kq, fp32read)
@@ -444,6 +520,8 @@ class MGAModel(nn.Module):
         for l in reversed(range(len(hier) - 1)):
             if l == 0 and self.read_mode == "amr":
                 hier[0] = self.amrread(hier[0], hier[1:], covers)
+            elif l == 0 and self.read_mode == "sparse":
+                hier[0] = self.sparseread(hier[0], hier[1], covers[0])
             else:
                 hier[l] = self._get(f"read_{l}")(hier[l], hier[l + 1],
                                                 covers[l], rope=rope)
