@@ -1,2 +1,3 @@
 {"step": 0, "loss": 3.4762, "digit_acc": 0.0, "exact": 0.0, "tok_s": 0, "sec": 3.2, "gnorm": 10.875, "emb_n": 1.875}
 {"step": 0, "eval_exact": 0.0, "eval_digit": 0.107, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
+{"step": 100, "loss": 2.3356, "digit_acc": 0.0938, "exact": 0.0, "tok_s": 22128, "sec": 151.3, "gnorm": 1.537, "emb_n": 2.489}
