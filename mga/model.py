@@ -28,6 +28,13 @@ CUDA note: folded-block batches can reach bs*nfull = 65536 rows, which
 exceeds the CUDA grid y-limit (65535) hit by some SDPA backends. Folded
 self-attention is therefore chunked to 8192 rows per call, and CrossAttn
 uses manual matmul attention (its matrices are small anyway).
+
+Flag verdicts (v0.1 audit, 2026-09-13): shift and exitloss are TOXIC at 512
+(bisect: 0.46/0.48 digit @1k vs 0.89 bare) and reverted; poolaux is useless
+at 4096 (R6); posxattn rejected. All default off, kept only as audit trail
+and v0.2 raw material. fp32read is moot (bf16 proven innocent by R3).
+Production recipe: bare config + curriculum ignition (ignite at 512, then
+run at target n; see topic.md).
 """
 import math
 

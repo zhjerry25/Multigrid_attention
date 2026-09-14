@@ -11,3 +11,5 @@
 {"step": 700, "loss": 1.4789, "digit_acc": 0.3812, "exact": 0.0, "tok_s": 21653, "sec": 897.5, "gnorm": 1.807, "emb_n": 5.213}
 {"step": 750, "eval_exact": 0.0, "eval_digit": 0.4492, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
 {"step": 800, "loss": 1.4604, "digit_acc": 0.4125, "exact": 0.0, "tok_s": 16250, "sec": 1099.1, "gnorm": 3.63, "emb_n": 5.387}
+{"step": 900, "loss": 1.373, "digit_acc": 0.4531, "exact": 0.0156, "tok_s": 22213, "sec": 1246.7, "gnorm": 1.861, "emb_n": 5.433}
+{"step": 999, "eval_exact": 0.0039, "eval_digit": 0.4828, "depth_exact": [0.0, 0.016, 0.0, 0.0], "cycles_exact": [0.0, 0.016]}
