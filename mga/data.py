@@ -10,18 +10,22 @@ passkey: filler with a needle [P, d1..d5] at a random position and
 
 copying: [pattern c tokens][SEP][filler][SEP][pattern]; loss on last c.
 
-mqar: n_pairs key->value pairs [(k_i, v_i)] spaced through filler, query
-[Q, k_q, v_q] at the end; loss on the final value. Keys are 8 dedicated
-tokens (22-29 shared with filler range is avoided: keys 10-17), values are
-digits -- recall requires content-addressed lookup among many distractors.
+mqar: n_pairs key->value pairs [(k_i, v_i)] spaced through filler, then
+[Q, k, v] x n_queries at the end; loss on the query values. Keys are 16
+dedicated tokens (10-25) sampled WITHOUT replacement (a permutation per
+sequence) -- an earlier version drew 16 pairs from 8 keys with replacement,
+making targets contradictory (same key, different values) and freezing the
+loss at ln(10). Fillers are 26-29 for this task only (passkey/copying
+keep 18-29); values are digits.
 """
 import torch
 
-FILL0, FILL1 = 18, 30  # filler tokens 18..29 (10-17 reserved as MQAR keys)
+FILL0, FILL1 = 18, 30  # filler tokens 18..29 (passkey/copying)
 P, Q, SEP = 30, 31, 32
 VOCAB = 34
 KEY = 5
-MQAR_KEYS = list(range(10, 18))
+MQAR_KEYS = list(range(10, 26))  # 16 distinct keys
+MQAR_FILL0, MQAR_FILL1 = 26, 30  # mqar-only fillers (26..29)
 
 
 def _targets(seq, loss_len):
@@ -61,22 +65,25 @@ def copying_batch(bs, n, g, device, c=None):
     return idx.to(device), tgt.to(device), mask.to(device), None
 
 
-def mqar_batch(bs, n, g, device, n_pairs=16):
-    seq = torch.randint(FILL0, FILL1, (bs, n + 1), generator=g)
-    seg = (n + 1 - 3) // n_pairs
+def mqar_batch(bs, n, g, device, n_pairs=16, n_queries=4):
+    tail = 3 * n_queries
+    seq = torch.randint(MQAR_FILL0, MQAR_FILL1, (bs, n + 1), generator=g)
+    seg = (n + 1 - tail) // n_pairs
     assert seg >= 2, "sequence too short for n_pairs"
-    ki = torch.randint(0, len(MQAR_KEYS), (bs, n_pairs), generator=g)
-    keys = torch.tensor(MQAR_KEYS)[ki]  # (bs, n_pairs)
+    ki = torch.argsort(torch.rand(bs, len(MQAR_KEYS), generator=g), dim=1)[:, :n_pairs]
+    keys = 10 + ki  # unique keys per sequence (no-replacement permutation)
     vals = torch.randint(0, 10, (bs, n_pairs), generator=g)
     off = torch.randint(0, seg - 1, (bs, n_pairs), generator=g)
     p = torch.arange(n_pairs).unsqueeze(0) * seg + off  # (bs, n_pairs)
     rows = torch.arange(bs).unsqueeze(1)
     seq[rows, p] = keys
     seq[rows, p + 1] = vals
-    qi = torch.randint(0, n_pairs, (bs,), generator=g)
-    r = torch.arange(bs)
-    seq[:, -3] = Q
-    seq[r, -2] = keys[r, qi]
-    seq[r, -1] = vals[r, qi]
-    idx, tgt, mask = _targets(seq, 1)
+    qi = torch.randint(0, n_pairs, (bs, n_queries), generator=g)
+    t = n + 1 - tail
+    seq[:, t::3] = Q
+    seq[:, t + 1::3] = keys.gather(1, qi)
+    seq[:, t + 2::3] = vals.gather(1, qi)
+    idx, tgt = seq[:, :-1], seq[:, 1:]
+    mask = torch.zeros(bs, n, dtype=torch.bool)
+    mask[:, t + 1::3] = True  # tgt positions predicting each value (after [Q,k])
     return idx.to(device), tgt.to(device), mask.to(device), None

@@ -88,4 +88,4 @@
 - 折叠批在 CUDA 上超 grid y 上限（65535）→ `FOLD_CHUNK=8192`；CrossAttn 手工 matmul（免疫 SDPA 后端差异）
 - 远程 AutoDL；`sweep.sh`（per-GPU worker 串行）；结构化日志 `runs/*.jsonl`（含 gnorm/emb_n/depth_exact/cycles_exact）
 - 关键 checkpoint：`runs/sp512.pt`（512 点火）、`runs/sp4096.pt`（4096 上岗）
-- 词汇表注意：`mga/data.py` 中 filler=18-29，10-17 保留为 MQAR keys
+- 词汇表分工（`mga/data.py`）：passkey/copying fillers=18-29；MQAR fillers=26-29、keys=10-25 **无放回**采样（曾因 8 key 有放回 → 同 key 不同 value 的矛盾标签 → loss 冻结于 ln(10)=2.30，已修复并验证一致性）
