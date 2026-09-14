@@ -1,4 +1,0 @@
-/Users/jerryzhou/Code/Multigrid_attention/.venv/lib/python3.13/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
-  cpu = _conversion_method_template(device=torch.device("cpu"))
---- mga mqar 16x4 d=128 lr=5e-4 ---
-0 loss 3.577 digit 0.0 exact 0.0 gn 7.4

@@ -79,6 +79,9 @@ BATCHERS = {"passkey": data.passkey_batch, "copying": data.copying_batch,
 def make_batch(args, g, device, n=None, split="train"):
     if args.task == "lm":
         return lmdata.lm_batch(args.bs, n or args.n, g, device, split=split)
+    if args.task == "mqar":
+        return data.mqar_batch(args.bs, n or args.n, g, device,
+                               n_queries=getattr(args, "nqueries", 4))
     return BATCHERS[args.task](args.bs, n or args.n, g, device)
 
 
@@ -389,6 +392,7 @@ def main():
                     help="v0.2: SparseRead (block top-m summaries + fine fanout)")
     ap.add_argument("--read_m", type=int, default=64, help="sparse read top-m")
     ap.add_argument("--read_mf", type=int, default=4, help="sparse read fine fanout")
+    ap.add_argument("--nqueries", type=int, default=4, help="mqar queries per sequence")
     ap.add_argument("--resume_weights_only", default="",
                     help="lenient weight resume (fresh opt/schedule, step 0)")
     ap.add_argument("--tag", default=None)
