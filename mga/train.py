@@ -20,7 +20,11 @@ import torch
 import torch.nn.functional as F
 
 from . import data
+from . import lmdata
 from .model import MGAModel, BaselineModel
+
+VOCABS = {"passkey": data.VOCAB, "copying": data.VOCAB, "mqar": data.VOCAB,
+          "lm": 256}
 
 
 def get_device():
@@ -40,8 +44,9 @@ def amp_ctx(args, device):
 def build(args, n=None, d=None, device="cpu"):
     n = n or args.n
     d = d or args.d
+    vocab = VOCABS.get(getattr(args, "task", "passkey"), data.VOCAB)
     if args.model == "mga":
-        m = MGAModel(data.VOCAB, n, d=d, h=args.heads, b=args.b, kq=args.k,
+        m = MGAModel(vocab, n, d=d, h=args.heads, b=args.b, kq=args.k,
                      cycles=args.cycles, shared=not args.unshared,
                      posxattn=getattr(args, "posxattn", False),
                      shift=getattr(args, "shift", False),
@@ -53,7 +58,7 @@ def build(args, n=None, d=None, device="cpu"):
                      read_m=getattr(args, "read_m", 64),
                      read_mf=getattr(args, "read_mf", 4))
     else:
-        m = BaselineModel(data.VOCAB, n, mode=args.model, d=d, h=args.heads,
+        m = BaselineModel(vocab, n, mode=args.model, d=d, h=args.heads,
                           depth=args.depth, window=args.b)
     return m.to(device)
 
@@ -68,10 +73,12 @@ def coarsenable(n, b, kq):
 
 
 BATCHERS = {"passkey": data.passkey_batch, "copying": data.copying_batch,
-            "mqar": data.mqar_batch}
+            "mqar": data.mqar_batch, "lm": lmdata.lm_batch}
 
 
-def make_batch(args, g, device, n=None):
+def make_batch(args, g, device, n=None, split="train"):
+    if args.task == "lm":
+        return lmdata.lm_batch(args.bs, n or args.n, g, device, split=split)
     return BATCHERS[args.task](args.bs, n or args.n, g, device)
 
 
@@ -214,11 +221,13 @@ def train(args, device):
             model.load_state_dict(ck["ema"])
         model.eval()
         g_eval = torch.Generator().manual_seed(args.seed + 200)
-        ems, pds, hits, poss = [], [], [], []
+        ems, pds, hits, poss, lss = [], [], [], [], []
         with torch.no_grad(), amp_ctx(args, device):
             for _ in range(8):
-                idx, tgt, mask, pos = make_batch(args, g_eval, device)
-                _, pd, em, hv = loss_and_acc(model, idx, tgt, mask)
+                idx, tgt, mask, pos = make_batch(args, g_eval, device,
+                                                 split="val")
+                l, pd, em, hv = loss_and_acc(model, idx, tgt, mask)
+                lss.append(l.item())
                 ems.append(em)
                 pds.append(pd)
                 if pos is not None:
@@ -227,6 +236,8 @@ def train(args, device):
         rec = dict(n=args.n, cycles=getattr(args, "cycles", None),
                    eval_exact=round(sum(ems) / len(ems), 4),
                    eval_digit=round(sum(pds) / len(pds), 4))
+        if args.task == "lm":
+            rec["bpc"] = round(sum(lss) / len(lss) / 0.6931, 4)
         if poss:
             h, p = torch.cat(hits).float(), torch.cat(poss)
             rec["depth_exact"] = [
@@ -293,11 +304,13 @@ def train(args, device):
                 backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 model.load_state_dict(ema)
             model.eval()
-            ems, pds, hits, poss = [], [], [], []
+            ems, pds, hits, poss, lss = [], [], [], [], []
             with torch.no_grad(), amp_ctx(args, device):
                 for _ in range(4):
-                    idx, tgt, mask, pos = make_batch(args, g_eval, device)
-                    _, pd, em, hv = loss_and_acc(model, idx, tgt, mask)
+                    idx, tgt, mask, pos = make_batch(args, g_eval, device,
+                                                     split="val")
+                    l, pd, em, hv = loss_and_acc(model, idx, tgt, mask)
+                    lss.append(l.item())
                     ems.append(em)
                     pds.append(pd)
                     if pos is not None:
@@ -305,6 +318,8 @@ def train(args, device):
                         poss.append(pos.cpu())
                 rec = dict(step=step, eval_exact=round(sum(ems) / len(ems), 4),
                            eval_digit=round(sum(pds) / len(pds), 4))
+                if args.task == "lm":
+                    rec["bpc"] = round(sum(lss) / len(lss) / 0.6931, 4)
                 if poss:
                     h, p = torch.cat(hits).float(), torch.cat(poss)
                     depth = []
@@ -335,7 +350,8 @@ def train(args, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mga", choices=["mga", "full", "local"])
-    ap.add_argument("--task", default="passkey", choices=["passkey", "copying", "mqar"])
+    ap.add_argument("--task", default="passkey",
+                    choices=["passkey", "copying", "mqar", "lm"])
     ap.add_argument("--n", type=int, default=4096)
     ap.add_argument("--b", type=int, default=16)
     ap.add_argument("--k", type=int, default=1, help="summaries per block (bandwidth)")
