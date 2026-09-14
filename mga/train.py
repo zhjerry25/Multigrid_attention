@@ -191,6 +191,46 @@ def train(args, device):
             ema = ck["ema"]
         start_step = ck["step"] + 1
         print(f"resumed from {args.resume} at step {start_step}", flush=True)
+    if args.eval_only:
+        assert args.resume, "--eval_only requires --resume"
+        if ck.get("ema") is not None:
+            model.load_state_dict(ck["ema"])
+        model.eval()
+        g_eval = torch.Generator().manual_seed(args.seed + 200)
+        ems, pds, hits, poss = [], [], [], []
+        with torch.no_grad(), amp_ctx(args, device):
+            for _ in range(8):
+                idx, tgt, mask, pos = make_batch(args, g_eval, device)
+                _, pd, em, hv = loss_and_acc(model, idx, tgt, mask)
+                ems.append(em)
+                pds.append(pd)
+                if pos is not None:
+                    hits.append(hv.cpu())
+                    poss.append(pos.cpu())
+        rec = dict(n=args.n, cycles=getattr(args, "cycles", None),
+                   eval_exact=round(sum(ems) / len(ems), 4),
+                   eval_digit=round(sum(pds) / len(pds), 4))
+        if poss:
+            h, p = torch.cat(hits).float(), torch.cat(poss)
+            rec["depth_exact"] = [
+                round(h[(p >= qi * args.n // 4) & (p < (qi + 1) * args.n // 4)]
+                      .mean().item(), 3)
+                if ((p >= qi * args.n // 4) & (p < (qi + 1) * args.n // 4)).any()
+                else -1
+                for qi in range(4)
+            ]
+        if args.model == "mga":
+            idx, tgt, mask, _ = make_batch(args, g_eval, device)
+            with torch.no_grad(), amp_ctx(args, device):
+                lgs = model(idx, all_cycles=True)
+            lgs = lgs[0] if isinstance(lgs, tuple) else lgs
+            rec["cycles_exact"] = [
+                round((lg[mask].argmax(-1) == tgt[mask]).view(idx.shape[0], -1)
+                      .all(1).float().mean().item(), 3)
+                for lg in lgs
+            ]
+        print(json.dumps(rec), flush=True)
+        return
     g_train = torch.Generator().manual_seed(args.seed + 100)
     g_eval = torch.Generator().manual_seed(args.seed + 200)
     os.makedirs("runs", exist_ok=True)
@@ -306,6 +346,8 @@ def main():
     ap.add_argument("--exitloss", action="store_true",
                     help="v0.1: per-cycle exit loss with increasing weights (mga only)")
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--eval_only", action="store_true",
+                    help="load --resume checkpoint, eval once at args.n/--cycles, exit")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.tag is None:
