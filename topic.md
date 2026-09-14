@@ -89,3 +89,4 @@
 - 远程 AutoDL；`sweep.sh`（per-GPU worker 串行）；结构化日志 `runs/*.jsonl`（含 gnorm/emb_n/depth_exact/cycles_exact）
 - 关键 checkpoint：`runs/sp512.pt`（512 点火）、`runs/sp4096.pt`（4096 上岗）
 - 词汇表分工（`mga/data.py`）：passkey/copying fillers=18-29；MQAR fillers=26-29、keys=10-25 **无放回**采样（曾因 8 key 有放回 → 同 key 不同 value 的矛盾标签 → loss 冻结于 ln(10)=2.30，已修复并验证一致性）
+- **MQAR 结论（2026-09-14，搁置）**：数据修复后仍不点火（1 对×1 查询的最小电路也只在 0.1 附近蠕动）。机制解释：passkey 的检索线索是**固定**标记 P（每个序列都在强化同一条"P 探测器"电路），MQAR 需要**变量 key 的通用归纳电路**——key 身份经池化瓶颈绑定后再匹配，信号稀释到点火阈值以下（同一根因的第四形态）。全注意力能学是因为它 token 级尖锐匹配。**架构当前局限的诚实记录**：变量 key 内容寻址在此监督密度下不可点火。如需复活：更密监督（每对都查询）、key 检测辅助任务、或标记化变体。循环必要性问题的探测改道（多 needle passkey / LM T 对比）
