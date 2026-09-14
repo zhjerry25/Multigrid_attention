@@ -3,8 +3,9 @@
 Usage:
   python -m mga.train --selftest
   python -m mga.train --model mga --n 4096 --cycles 2 --k 4 --shift \
-      --steps 4000 --bs 256 --lr 2e-3 --exitloss --posxattn --ema 0.999 \
-      --bf16 --curr 512,1024,2048,4096 --save runs/ck.pt --ckpt_every 1000
+      --steps 4000 --bs 256 --lr 1e-3 --exitloss --posxattn --ema 0.999 \
+      --bf16 --fp32read --poolaux --curr 512,1024,2048,4096 \
+      --save runs/ck.pt --ckpt_every 1000
   python -m mga.train --model local --n 4096
   python -m mga.train --model full --n 4096 --bf16   # flash path on CUDA
 """
@@ -43,7 +44,9 @@ def build(args, n=None, d=None, device="cpu"):
         m = MGAModel(data.VOCAB, n, d=d, h=args.heads, b=args.b, kq=args.k,
                      cycles=args.cycles, shared=not args.unshared,
                      posxattn=getattr(args, "posxattn", False),
-                     shift=getattr(args, "shift", False))
+                     shift=getattr(args, "shift", False),
+                     fp32read=getattr(args, "fp32read", False),
+                     poolaux=getattr(args, "poolaux", False))
     else:
         m = BaselineModel(data.VOCAB, n, mode=args.model, d=d, h=args.heads,
                           depth=args.depth, window=args.b)
@@ -67,18 +70,22 @@ def make_batch(args, g, device, n=None):
     return BATCHERS[args.task](args.bs, n or args.n, g, device)
 
 
-def loss_and_acc(model, idx, tgt, mask, exit_w=None):
+def loss_and_acc(model, idx, tgt, mask, exit_w=None, aux_w=0.0):
     """CE on masked positions; with exit_w (mga only), weighted sum of
-    per-cycle exit losses. Accuracy/hits are from the last cycle.
-    Returns (loss, digit_acc, exact, hit_vec)."""
+    per-cycle exit losses; with poolaux, models return (logits, aux) and the
+    BOW auxiliary loss is added with weight aux_w. Accuracy is always from
+    the last cycle. Returns (loss, digit_acc, exact, hit_vec)."""
+    ret = model(idx, all_cycles=exit_w is not None)
+    aux = ret[1] if isinstance(ret, tuple) else None
+    logits = ret[0] if isinstance(ret, tuple) else ret
     if exit_w is not None:
-        logits_list = model(idx, all_cycles=True)
         loss = sum(w * F.cross_entropy(lg[mask], tgt[mask])
-                   for w, lg in zip(exit_w, logits_list)) / sum(exit_w)
-        logits = logits_list[-1]
+                   for w, lg in zip(exit_w, logits)) / sum(exit_w)
+        logits = logits[-1]
     else:
-        logits = model(idx)
         loss = F.cross_entropy(logits[mask], tgt[mask])
+    if aux is not None and aux_w > 0:
+        loss = loss + aux_w * aux
     lp, tp = logits[mask], tgt[mask]
     hit = (lp.argmax(-1) == tp).view(idx.shape[0], -1)
     hit_vec = hit.all(1)
@@ -168,6 +175,9 @@ def train(args, device):
         t = args.cycles
         exit_w = [1.0] if t == 1 else [0.3 + 0.7 * i / (t - 1) for i in range(t)]
         print(f"exit loss weights: {[round(w, 2) for w in exit_w]}", flush=True)
+    aux_w = 0.1 if (args.poolaux and args.model == "mga") else 0.0
+    if aux_w:
+        print(f"pool BOW aux loss weight {aux_w}", flush=True)
     ema = None
     if args.ema > 0:
         ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -195,10 +205,10 @@ def train(args, device):
         idx, tgt, mask, pos = make_batch(args, g_train, device, n=n_b)
         model.train()
         with amp_ctx(args, device):
-            loss, pd, em, _ = loss_and_acc(model, idx, tgt, mask, exit_w)
+            loss, pd, em, _ = loss_and_acc(model, idx, tgt, mask, exit_w, aux_w)
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if ema is not None:
             with torch.no_grad():
@@ -209,7 +219,9 @@ def train(args, device):
             tok_s = int(args.bs * n_b * 100 / max(now - last_t, 1e-9)) if step > 0 else 0
             last_t = now
             rec = dict(step=step, loss=round(loss.item(), 4), digit_acc=round(pd, 4),
-                       exact=round(em, 4), tok_s=tok_s, sec=round(now - t0, 1))
+                       exact=round(em, 4), tok_s=tok_s, sec=round(now - t0, 1),
+                       gnorm=round(float(gnorm), 3),
+                       emb_n=round(model.emb.weight.norm().item(), 3))
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
@@ -243,6 +255,7 @@ def train(args, device):
                 if args.model == "mga":
                     idx, tgt, mask, _ = make_batch(args, g_eval, device)
                     lgs = model(idx, all_cycles=True)
+                    lgs = lgs[0] if isinstance(lgs, tuple) else lgs
                     rec["cycles_exact"] = [
                         round((lg[mask].argmax(-1) == tgt[mask]).view(idx.shape[0], -1)
                               .all(1).float().mean().item(), 3)
@@ -276,6 +289,10 @@ def main():
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--ema", type=float, default=0.0, help="EMA eval decay, 0=off")
     ap.add_argument("--bf16", action="store_true", help="CUDA bf16 autocast")
+    ap.add_argument("--fp32read", action="store_true",
+                    help="v0.1: force read-path softmax in fp32 under bf16")
+    ap.add_argument("--poolaux", action="store_true",
+                    help="v0.1: BOW auxiliary loss on level-0 summaries")
     ap.add_argument("--curr", default="", help="length curriculum, e.g. 512,1024,4096")
     ap.add_argument("--save", default="", help="checkpoint path (.pt)")
     ap.add_argument("--ckpt_every", type=int, default=0, help="periodic save interval")

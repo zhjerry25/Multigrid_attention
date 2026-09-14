@@ -17,6 +17,11 @@ v0.1 additions:
   partial blocks causal-clean)
 - posxattn: block-local RoPE on Pool keys; Read q at token index, k at
   cover_end -- the q.k dot product then directly encodes token distance
+- fp32read: read softmax computed in fp32 (ignition contrast near the bf16
+  noise floor is a suspected cause of the 4096 training failure)
+- poolaux: bag-of-words auxiliary loss on level-0 summaries (predict which
+  tokens their block contains) -- direct dense gradient to Pool, breaking
+  the pool<->read chicken-and-egg that scales with summary count
 - full baseline uses SDPA is_causal (flash path on CUDA, no big mask)
 
 CUDA note: folded-block batches can reach bs*nfull = 65536 rows, which
@@ -106,11 +111,13 @@ class Block(nn.Module):
 class CrossAttn(nn.Module):
     """Multi-head cross-attention, manual matmul attention (small matrices;
     avoids SDPA backend quirks and folded-batch grid limits). Keys/values
-    carry no positional encoding unless rope + positions are passed."""
+    carry no positional encoding unless rope + positions are passed.
+    fp32_softmax forces the softmax in fp32 under bf16 autocast."""
 
-    def __init__(self, d, h):
+    def __init__(self, d, h, fp32_softmax=False):
         super().__init__()
         self.h = h
+        self.fp32_softmax = fp32_softmax
         self.wq = nn.Linear(d, d, bias=False)
         self.wkv = nn.Linear(d, 2 * d, bias=False)
         self.out = nn.Linear(d, d, bias=False)
@@ -131,7 +138,10 @@ class CrossAttn(nn.Module):
         scores = q @ k.transpose(-2, -1) / math.sqrt(hd)
         if mask is not None:
             scores = scores.masked_fill(~mask, float("-inf"))
-        o = torch.softmax(scores, dim=-1) @ v
+        if self.fp32_softmax:
+            o = torch.softmax(scores.float(), dim=-1).to(v.dtype) @ v
+        else:
+            o = torch.softmax(scores, dim=-1) @ v
         return self.out(o.transpose(1, 2).reshape(b, tq, c))
 
 
@@ -141,12 +151,12 @@ class Pool(nn.Module):
     ends, so no leak). Handles partial head/tail segments from shifts and
     non-divisible lengths."""
 
-    def __init__(self, d, h, kq=1):
+    def __init__(self, d, h, kq=1, fp32_softmax=False):
         super().__init__()
         self.kq = kq
         self.queries = nn.Parameter(torch.randn(kq, d) * 0.02)
         self.ln = nn.LayerNorm(d)
-        self.xattn = CrossAttn(d, h)
+        self.xattn = CrossAttn(d, h, fp32_softmax)
 
     def _pool_seg(self, x, rope):
         # x: (B', t, c) -> (B', kq, c)
@@ -183,10 +193,10 @@ class Read(nn.Module):
     token. Residual, pre-norm. With rope: queries rotate at token index,
     keys at cover_end -- the dot product encodes exact distance."""
 
-    def __init__(self, d, h):
+    def __init__(self, d, h, fp32_softmax=False):
         super().__init__()
         self.ln = nn.LayerNorm(d)
-        self.xattn = CrossAttn(d, h)
+        self.xattn = CrossAttn(d, h, fp32_softmax)
         self.null = nn.Parameter(torch.randn(1, 1, d) * 0.02)
 
     def forward(self, x, summaries, cover_end, rope=None):
@@ -209,7 +219,7 @@ class Read(nn.Module):
 
 class MGAModel(nn.Module):
     def __init__(self, vocab, n, d=256, h=4, b=16, kq=1, cycles=2, shared=True,
-                 posxattn=False, shift=False):
+                 posxattn=False, shift=False, fp32read=False, poolaux=False):
         super().__init__()
         assert b % kq == 0, "kq must divide b"
         m, n_levels = n, 0
@@ -219,21 +229,25 @@ class MGAModel(nn.Module):
             n_levels += 1
         self.b, self.kq, self.cycles, self.shared = b, kq, cycles, shared
         self.posxattn, self.shift = posxattn, (b // 2 if shift else 0)
+        self.poolaux = poolaux
+        self.vocab = vocab
         self.emb = nn.Embedding(vocab, d)
         nn.init.normal_(self.emb.weight, std=0.02)
         self.head = nn.Linear(d, vocab, bias=False)
         self.head.weight = self.emb.weight
         self.rope = RoPE(d // h, max(n, 8192))
+        if poolaux:
+            self.poolaux_head = nn.Linear(d, vocab)
         if shared:
             self.block = Block(d, h, self.rope)
-            self.pool = Pool(d, h, kq)
-            self.read = Read(d, h)
+            self.pool = Pool(d, h, kq, fp32read)
+            self.read = Read(d, h, fp32read)
         else:
             mods = {}
             for l in range(n_levels):
                 mods[f"smooth_{l}"] = Block(d, h, self.rope)
-                mods[f"pool_{l}"] = Pool(d, h, kq)
-                mods[f"read_{l}"] = Read(d, h)
+                mods[f"pool_{l}"] = Pool(d, h, kq, fp32read)
+                mods[f"read_{l}"] = Read(d, h, fp32read)
                 mods[f"post_{l}"] = Block(d, h, self.rope)
             mods["top"] = Block(d, h, self.rope)
             self.mods = nn.ModuleDict(mods)
@@ -266,15 +280,32 @@ class MGAModel(nn.Module):
             parts.append(blk(s[:, t - rem:], causal_mask(rem, s.device)))
         return torch.cat(parts, dim=1)
 
-    def _vcycle(self, s0, shift=0):
+    def _bow_aux(self, summaries, cover_end, idx):
+        """BCE on level-0 summaries predicting the bag-of-words of the block
+        they cover. Direct dense gradient to Pool (breaks chicken-and-egg)."""
+        bs, t = idx.shape
+        ns = cover_end.numel()
+        seg_id = torch.bucketize(torch.arange(t, device=idx.device),
+                                 cover_end, right=True)
+        onehot = F.one_hot(idx, self.vocab).to(summaries.dtype)
+        multi = torch.zeros(bs, ns, self.vocab, device=idx.device,
+                            dtype=summaries.dtype)
+        multi.index_add_(1, seg_id, onehot)
+        multi = multi.clamp_(0, 1)
+        return F.binary_cross_entropy_with_logits(self.poolaux_head(summaries),
+                                                  multi)
+
+    def _vcycle(self, s0, shift=0, idx=None):
         b = self.b
         rope = self.rope if self.posxattn else None
-        hier, covers = [s0], []
+        hier, covers, auxes = [s0], [], []
         s, l = s0, 0
         while s.shape[1] > b:
             sh = shift if l == 0 else 0
             s = self._apply_block(self._get(f"smooth_{l}"), s, sh)
             s, cover_end = self._get(f"pool_{l}")(s, b, rope=rope, shift=sh)
+            if l == 0 and idx is not None:
+                auxes.append(self._bow_aux(s, cover_end, idx))
             hier.append(s)
             covers.append(cover_end)
             l += 1
@@ -283,15 +314,20 @@ class MGAModel(nn.Module):
             hier[l] = self._get(f"read_{l}")(hier[l], hier[l + 1], covers[l], rope=rope)
             hier[l] = self._apply_block(self._get(f"post_{l}"), hier[l],
                                         shift if l == 0 else 0)
-        return hier[0]
+        return hier[0], auxes
 
     def forward(self, idx, all_cycles=False):
         s = self.emb(idx)
-        outs = []
+        outs, auxes = [], []
         for t in range(self.cycles):
-            s = self._vcycle(s, shift=self.shift if t % 2 == 1 else 0)
+            s, aux = self._vcycle(s, shift=self.shift if t % 2 == 1 else 0,
+                                  idx=idx if self.poolaux else None)
+            auxes.extend(aux)
             outs.append(self.head(self.lnf(s)))
-        return outs if all_cycles else outs[-1]
+        res = outs if all_cycles else outs[-1]
+        if self.poolaux:
+            return res, (torch.stack(auxes).mean() if auxes else s.sum() * 0.0)
+        return res
 
 
 class BaselineModel(nn.Module):

@@ -1,0 +1,5 @@
+{"step": 0, "loss": 3.6094, "digit_acc": 0.0, "exact": 0.0, "tok_s": 0, "sec": 1.8, "gnorm": 13.297, "emb_n": 1.875}
+{"step": 0, "eval_exact": 0.0, "eval_digit": 0.0086, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
+{"step": 100, "loss": 2.3245, "digit_acc": 0.0875, "exact": 0.0, "tok_s": 21089, "sec": 157.2, "gnorm": 1.526, "emb_n": 2.399}
+{"step": 200, "loss": 2.1823, "digit_acc": 0.1594, "exact": 0.0, "tok_s": 15803, "sec": 364.5, "gnorm": 0.99, "emb_n": 2.905}
+{"step": 250, "eval_exact": 0.0, "eval_digit": 0.1789, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
