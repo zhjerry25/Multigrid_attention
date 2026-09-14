@@ -4,3 +4,17 @@
 {"step": 200, "loss": 2.1823, "digit_acc": 0.1594, "exact": 0.0, "tok_s": 15803, "sec": 364.5, "gnorm": 0.99, "emb_n": 2.905}
 {"step": 250, "eval_exact": 0.0, "eval_digit": 0.1789, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
 {"step": 300, "loss": 2.0837, "digit_acc": 0.1969, "exact": 0.0, "tok_s": 18365, "sec": 542.9, "gnorm": 1.232, "emb_n": 3.4}
+{"step": 400, "loss": 2.0631, "digit_acc": 0.1656, "exact": 0.0, "tok_s": 23019, "sec": 685.3, "gnorm": 0.971, "emb_n": 4.038}
+{"step": 500, "loss": 2.1251, "digit_acc": 0.1969, "exact": 0.0, "tok_s": 24442, "sec": 819.3, "gnorm": 2.412, "emb_n": 4.628}
+{"step": 500, "eval_exact": 0.0, "eval_digit": 0.1844, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
+{"step": 600, "loss": 2.1023, "digit_acc": 0.1781, "exact": 0.0, "tok_s": 23226, "sec": 960.4, "gnorm": 1.001, "emb_n": 5.129}
+{"step": 700, "loss": 2.0885, "digit_acc": 0.1625, "exact": 0.0, "tok_s": 26111, "sec": 1085.9, "gnorm": 1.323, "emb_n": 5.323}
+{"step": 750, "eval_exact": 0.0, "eval_digit": 0.1922, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
+{"step": 800, "loss": 2.0319, "digit_acc": 0.1719, "exact": 0.0, "tok_s": 21998, "sec": 1234.9, "gnorm": 1.027, "emb_n": 5.455}
+{"step": 900, "loss": 2.0171, "digit_acc": 0.1781, "exact": 0.0, "tok_s": 23701, "sec": 1373.1, "gnorm": 0.617, "emb_n": 5.476}
+{"step": 1000, "loss": 2.0278, "digit_acc": 0.1875, "exact": 0.0, "tok_s": 24931, "sec": 1504.6, "gnorm": 0.706, "emb_n": 5.505}
+{"step": 1000, "eval_exact": 0.0, "eval_digit": 0.1922, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
+{"step": 1100, "loss": 1.9735, "digit_acc": 0.2219, "exact": 0.0, "tok_s": 27475, "sec": 1623.8, "gnorm": 2.61, "emb_n": 5.603}
+{"step": 1200, "loss": 2.0541, "digit_acc": 0.1906, "exact": 0.0, "tok_s": 22423, "sec": 1770.0, "gnorm": 0.821, "emb_n": 5.728}
+{"step": 1250, "eval_exact": 0.0, "eval_digit": 0.1961, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
+{"step": 1300, "loss": 2.0404, "digit_acc": 0.1813, "exact": 0.0, "tok_s": 23573, "sec": 1909.0, "gnorm": 0.74, "emb_n": 5.823}

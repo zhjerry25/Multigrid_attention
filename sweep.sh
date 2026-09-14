@@ -18,7 +18,7 @@ echo "[sweep] GPUs: ${GPUS[*]} (python: $PY)"
 
 $PY -m mga.train --selftest || { echo "[sweep] selftest FAILED, abort"; exit 1; }
 
-MGA="--exitloss --posxattn --ema 0.999 --bf16 --fp32read --poolaux --steps 4000 --bs 256 --lr 1e-3 --eval_every 250"
+MGA="--ema 0.999 --bf16 --steps 4000 --bs 256 --lr 1e-3 --eval_every 250"
 BASE="--bf16 --steps 4000 --bs 256 --lr 1e-3 --eval_every 250"
 CURR="--curr 512,1024,2048,4096"
 
