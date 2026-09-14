@@ -156,6 +156,8 @@ posxattn（新实现）驳回（用户决定）；bisect 审计终结。
 
 **远程验收门**：512 点火 → 4096 resume ≥0.96（不掉点主门）→ 16k 零样本 ≥0.9 且深位桶提升 → 65k 前向可跑 → MQAR 泛化。
 
+**冷启动问题与修复（2026-09-14）**：AMR 裸点火在 512 慢 ~10×——探索稀释（随机选择下 needle 期望注意力 ~0.6% vs dense 恒定 3%）+ argmax detach 阻断 fine 路径对 scorer 的反哺 + 贪婪 beam 零探索。修复三件套（`cf8d45e`）：①`_st` 直通梯度（选中块内容梯度回灌 scorer 选中臂）；②`--explore_steps` Gumbel 探索退火（τ 1→0，eval 硬化）；③`--resume_weights_only`（dense ckpt → AMR 接手，复用 stage512.pt 零重训）。生产路径 = dense 点火 → AMR 接手；冷启动是否可免靠 B 组实验裁决。
+
 ## v0.2 方向（从 v0.1 证据生长出来，按优先级）
 
 1. ~~不动点训练~~（用户否决，搁置）。
