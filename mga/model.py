@@ -226,11 +226,15 @@ class AMRRead(nn.Module):
     Per token: b*log_b(n) beam keys + m*b fine keys -> O(n*b*log n) total.
     Requires kq=1, no shift, >=2 summary levels (regular b-ary tree).
     Selection indices are detached; gradients flow through softmax weights
-    and the fine read."""
+    and the fine read. Selected gathers get a straight-through correction
+    (value unchanged, gradient routes the fine path's success back to the
+    scorer's selected arm). Training-time Gumbel noise (tau annealed to 0
+    by the trainer) gives cold-start exploration; eval is always hard."""
 
     def __init__(self, d, h, m=4):
         super().__init__()
         self.h, self.m = h, m
+        self.tau = 0.0  # Gumbel noise scale, annealed externally
         self.ln = nn.LayerNorm(d)
         self.scorer = CrossAttn(d, h)  # beam scoring, shared across levels
         self.fine = CrossAttn(d, h)    # fine read of selected raw tokens
@@ -250,6 +254,25 @@ class AMRRead(nn.Module):
         w = torch.softmax(scores, dim=-1)
         ctx = torch.einsum("bhnc,bnchd->bnhd", w, v).reshape(bs, n, d)
         return ctx, w.mean(dim=1)
+
+    def _select(self, probs):
+        """argmax with optional Gumbel exploration noise (train only)."""
+        if self.training and self.tau > 0:
+            u = torch.rand_like(probs).clamp_min(1e-9)
+            probs = probs + (-torch.log(-u.log())) * self.tau
+        return probs.argmax(dim=-1)
+
+    @staticmethod
+    def _st(gathered, probs, sel):
+        """Straight-through correction: forward value unchanged, backward
+        sends gathered-content gradient to the selected arm's probability."""
+        if sel.dim() == probs.dim() - 1:
+            p = probs.gather(-1, sel.unsqueeze(-1).clamp_min(0))
+        else:
+            p = probs.gather(-1, sel.clamp_min(0))
+        while p.dim() < gathered.dim():
+            p = p.unsqueeze(-1)
+        return gathered * (1.0 + (p - p.detach()))
 
     def forward(self, x, up_levels, covers):
         """x: (bs,n,d) level-0 states; up_levels: [hier[1]..hier[L]] (>=2);
@@ -272,13 +295,14 @@ class AMRRead(nn.Module):
         ).unsqueeze(0).expand(bs, n, 1 + ntop)
 
         ctx, parent = 0, None
-        topm = None
+        topm, topm_probs = None, None
         for lvl in range(L - 1, -1, -1):
             step_ctx, probs = self._beam_attn(q, cand, mask)
             ctx = ctx + step_ctx
-            sel = probs.argmax(dim=-1)  # (bs, n), detached selection index
+            sel = self._select(probs)  # (bs, n), detached (noisy) argmax
             if lvl == 0:
                 topm = probs.topk(min(self.m, probs.shape[-1]), dim=-1).indices
+                topm_probs = probs
             else:
                 # gather children of the selected summary as next candidates
                 child_src = up_levels[lvl - 1]
@@ -286,6 +310,7 @@ class AMRRead(nn.Module):
                 null_group = self.null.expand(bs, b, d).unsqueeze(1)
                 groups = torch.cat([null_group, groups], dim=1)
                 cand = groups[torch.arange(bs).unsqueeze(1), sel]
+                cand = self._st(cand, probs, sel)
                 mask = None  # children tile parent's past range: always safe
                 parent = sel
 
@@ -301,6 +326,7 @@ class AMRRead(nn.Module):
                                torch.zeros_like(topm),
                                base.unsqueeze(-1) + topm)  # (bs, n, m)
         fine_keys = block_map[torch.arange(bs).view(bs, 1, 1), fine_idx]
+        fine_keys = self._st(fine_keys, topm_probs, topm)
         fine_keys = fine_keys.reshape(bs, n, -1, d)
 
         qf = self.fine.wq(self.ln(x)).view(bs, n, self.h, -1).transpose(1, 2)

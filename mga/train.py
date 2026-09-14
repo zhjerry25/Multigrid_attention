@@ -185,7 +185,16 @@ def train(args, device):
         ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
     start_step = 0
-    if args.resume:
+    if args.resume_weights_only:
+        # for switching read_mode / architecture variants: load weights
+        # leniently, fresh optimizer/EMA, restart step counter and schedule
+        ck = torch.load(args.resume, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        print(f"weights-only resume from {args.resume}: "
+              f"{len(missing)} new / {len(unexpected)} skipped params", flush=True)
+        for k in missing:
+            print(f"  + new: {k}", flush=True)
+    elif args.resume:
         ck = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
@@ -244,6 +253,9 @@ def train(args, device):
         n_b = args.n
         if curr is not None and step < args.steps // 2:
             n_b = curr[torch.randint(len(curr), (1,), generator=g_train).item()]
+        if args.model == "mga" and getattr(model, "read_mode", None) == "amr" \
+                and args.explore_steps > 0:
+            model.amrread.tau = max(0.0, 1.0 - step / args.explore_steps)
         idx, tgt, mask, pos = make_batch(args, g_train, device, n=n_b)
         model.train()
         with amp_ctx(args, device):
@@ -349,6 +361,10 @@ def main():
                     help="v0.1: per-cycle exit loss with increasing weights (mga only)")
     ap.add_argument("--amr", action="store_true",
                     help="v0.2: AMR read (tree descent + fine fanout) at level 0")
+    ap.add_argument("--explore_steps", type=int, default=0,
+                    help="v0.2: Gumbel exploration anneal steps for AMR cold start")
+    ap.add_argument("--resume_weights_only", default="",
+                    help="lenient weight resume (fresh opt/schedule, step 0)")
     ap.add_argument("--tag", default=None)
     ap.add_argument("--eval_only", action="store_true",
                     help="load --resume checkpoint, eval once at args.n/--cycles, exit")
