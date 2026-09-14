@@ -87,7 +87,7 @@ def loss_and_acc(model, idx, tgt, mask, exit_w=None, aux_w=0.0):
     per-cycle exit losses; with poolaux, models return (logits, aux) and the
     BOW auxiliary loss is added with weight aux_w. Accuracy is always from
     the last cycle. Returns (loss, digit_acc, exact, hit_vec)."""
-    ret = model(idx, all_cycles=exit_w is not None)
+    ret = model(idx, all_cycles=True) if exit_w is not None else model(idx)
     aux = ret[1] if isinstance(ret, tuple) else None
     logits = ret[0] if isinstance(ret, tuple) else ret
     if exit_w is not None:
