@@ -188,9 +188,10 @@ def train(args, device):
     if args.resume_weights_only:
         # for switching read_mode / architecture variants: load weights
         # leniently, fresh optimizer/EMA, restart step counter and schedule
-        ck = torch.load(args.resume, map_location=device, weights_only=False)
+        ck = torch.load(args.resume_weights_only, map_location=device,
+                        weights_only=False)
         missing, unexpected = model.load_state_dict(ck["model"], strict=False)
-        print(f"weights-only resume from {args.resume}: "
+        print(f"weights-only resume from {args.resume_weights_only}: "
               f"{len(missing)} new / {len(unexpected)} skipped params", flush=True)
         for k in missing:
             print(f"  + new: {k}", flush=True)
