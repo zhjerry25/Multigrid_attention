@@ -3,3 +3,4 @@
 {"step": 100, "loss": 2.3245, "digit_acc": 0.0875, "exact": 0.0, "tok_s": 21089, "sec": 157.2, "gnorm": 1.526, "emb_n": 2.399}
 {"step": 200, "loss": 2.1823, "digit_acc": 0.1594, "exact": 0.0, "tok_s": 15803, "sec": 364.5, "gnorm": 0.99, "emb_n": 2.905}
 {"step": 250, "eval_exact": 0.0, "eval_digit": 0.1789, "depth_exact": [0.0, 0.0, 0.0, 0.0], "cycles_exact": [0.0, 0.0]}
+{"step": 300, "loss": 2.0837, "digit_acc": 0.1969, "exact": 0.0, "tok_s": 18365, "sec": 542.9, "gnorm": 1.232, "emb_n": 3.4}
