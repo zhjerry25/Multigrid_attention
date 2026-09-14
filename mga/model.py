@@ -1,4 +1,4 @@
-"""MGA v0.1: causal multigrid V-cycle transformer, plus full/local baselines.
+"""MGA v0.2: causal multigrid V-cycle transformer with AMR read path.
 
 One V-cycle = bottom-up smoothing + learned pooling (restriction),
 full-causal solve at the top level, then top-down cross-attention read
@@ -7,34 +7,31 @@ shared across all levels and all cycles unless `shared=False`.
 
 Causality rule: a summary may be read by token i only if every token it
 covers is < i. Tracked explicitly via cover_end per summary (one past the
-last covered position, in that level's coordinates), which also makes
-shifted partitions and partial blocks sound.
+last covered position, in that level's coordinates).
 
-v0.1 additions:
-- kq > 1 summaries per block (bandwidth knob; requires b % kq == 0)
-- shifted blocking: odd cycles offset the level-0 partition by b//2 so any
-  token pair is co-blocked in some cycle (head/mid/tail segmentation keeps
-  partial blocks causal-clean)
-- posxattn: block-local RoPE on Pool keys; Read q at token index, k at
-  cover_end -- the q.k dot product then directly encodes token distance
-- fp32read: read softmax computed in fp32 (ignition contrast near the bf16
-  noise floor is a suspected cause of the 4096 training failure)
-- poolaux: bag-of-words auxiliary loss on level-0 summaries (predict which
-  tokens their block contains) -- direct dense gradient to Pool, breaking
-  the pool<->read chicken-and-egg that scales with summary count
-- full baseline uses SDPA is_causal (flash path on CUDA, no big mask)
+v0.2 (AMR read, read_mode="amr"): replaces the level-0 dense summary read
+O(n^2/b^2) with a batched top-down tree descent + fine-grained fanout:
+  1. beam descent: score candidate summaries level by level (top-1 argmax
+     selects the children forming the next candidate set), softmax weights
+     give a per-level coarse context;
+  2. final top-m fanout: the m winning level-1 summaries are expanded to
+     their raw level-0 tokens for a token-level fine read;
+  3. per-token keys: b*log_b(n) beam + m*b fine + b local -> O(n*b*log n).
+Children always tile their parent's cover range, so cover_end(parent) <= i
+implies cover_end(child) <= i: descent is causally safe by construction
+(only the top candidate set needs a cover_end mask). Selection indices are
+detached (argmax/topk); gradients flow through the softmax weights and the
+fine attention (MoBA/NSA convention). Higher levels keep the dense Read.
 
-CUDA note: folded-block batches can reach bs*nfull = 65536 rows, which
-exceeds the CUDA grid y-limit (65535) hit by some SDPA backends. Folded
-self-attention is therefore chunked to 8192 rows per call, and CrossAttn
-uses manual matmul attention (its matrices are small anyway).
-
-Flag verdicts (v0.1 audit, 2026-09-13): shift and exitloss are TOXIC at 512
-(bisect: 0.46/0.48 digit @1k vs 0.89 bare) and reverted; poolaux is useless
-at 4096 (R6); posxattn rejected. All default off, kept only as audit trail
-and v0.2 raw material. fp32read is moot (bf16 proven innocent by R3).
+v0.1 additions (audit trail, all default OFF -- verdicts in topic.md):
+kq>1 bandwidth, shifted blocking (TOXIC at 512), posxattn (rejected),
+fp32read (moot: bf16 innocent), poolaux (useless at 4096), exitloss (TOXIC).
 Production recipe: bare config + curriculum ignition (ignite at 512, then
 run at target n; see topic.md).
+
+CUDA note: folded-block batches are chunked to 8192 rows per attention call
+(some SDPA backends exceed the CUDA grid y-limit at 65536 rows), and
+CrossAttn uses manual matmul attention.
 """
 import math
 
@@ -195,10 +192,9 @@ class Pool(nn.Module):
 
 
 class Read(nn.Module):
-    """Prolongation: tokens cross-attend to summaries with cover_end <= their
-    position (strictly past coverage), plus an always-visible learned null
-    token. Residual, pre-norm. With rope: queries rotate at token index,
-    keys at cover_end -- the dot product encodes exact distance."""
+    """Prolongation (dense): tokens cross-attend to summaries with
+    cover_end <= their position, plus an always-visible learned null token.
+    Residual, pre-norm."""
 
     def __init__(self, d, h, fp32_softmax=False):
         super().__init__()
@@ -224,19 +220,119 @@ class Read(nn.Module):
         return x + self.xattn(self.ln(x), kv, mask, rope=rope, q_pos=q_pos, k_pos=k_pos)
 
 
+class AMRRead(nn.Module):
+    """Prolongation (AMR): batched top-down tree descent + top-m fine fanout.
+
+    Per token: b*log_b(n) beam keys + m*b fine keys -> O(n*b*log n) total.
+    Requires kq=1, no shift, >=2 summary levels (regular b-ary tree).
+    Selection indices are detached; gradients flow through softmax weights
+    and the fine read."""
+
+    def __init__(self, d, h, m=4):
+        super().__init__()
+        self.h, self.m = h, m
+        self.ln = nn.LayerNorm(d)
+        self.scorer = CrossAttn(d, h)  # beam scoring, shared across levels
+        self.fine = CrossAttn(d, h)    # fine read of selected raw tokens
+        self.null = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+
+    def _beam_attn(self, q, cand, mask):
+        """q: (bs,h,n,hd); cand: (bs,n,c,d) per-token candidates; mask:
+        (bs,n,c) bool or None. Returns (ctx (bs,n,d), head-mean probs (bs,n,c))."""
+        bs, n, c, d = cand.shape
+        hd = q.shape[-1]
+        k, v = self.scorer.wkv(cand).chunk(2, dim=-1)
+        k = k.view(bs, n, c, self.h, hd)
+        v = v.view(bs, n, c, self.h, hd)
+        scores = torch.einsum("bhnd,bnchd->bhnc", q, k) / math.sqrt(hd)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
+        w = torch.softmax(scores, dim=-1)
+        ctx = torch.einsum("bhnc,bnchd->bnhd", w, v).reshape(bs, n, d)
+        return ctx, w.mean(dim=1)
+
+    def forward(self, x, up_levels, covers):
+        """x: (bs,n,d) level-0 states; up_levels: [hier[1]..hier[L]] (>=2);
+        covers kept for interface parity (cover ranges follow the tree)."""
+        bs, n, d = x.shape
+        b = n // up_levels[0].shape[1]  # block factor of the regular tree
+        L = len(up_levels)
+        top = up_levels[-1]
+        ntop = top.shape[1]
+        q = self.scorer.wq(self.ln(x)).view(bs, n, self.h, -1).transpose(1, 2)
+
+        # initial candidates: null + top summaries, masked by cover_end <= i
+        cand = torch.cat([self.null.expand(bs, 1, d), top], dim=1)
+        cand = cand.unsqueeze(1).expand(bs, n, 1 + ntop, d)
+        cover_top = (torch.arange(ntop, device=x.device) + 1) * (n // ntop)
+        i = torch.arange(n, device=x.device).unsqueeze(1)
+        mask = torch.cat(
+            [torch.ones(n, 1, dtype=torch.bool, device=x.device), cover_top <= i],
+            dim=1,
+        ).unsqueeze(0).expand(bs, n, 1 + ntop)
+
+        ctx, parent = 0, None
+        topm = None
+        for lvl in range(L - 1, -1, -1):
+            step_ctx, probs = self._beam_attn(q, cand, mask)
+            ctx = ctx + step_ctx
+            sel = probs.argmax(dim=-1)  # (bs, n), detached selection index
+            if lvl == 0:
+                topm = probs.topk(min(self.m, probs.shape[-1]), dim=-1).indices
+            else:
+                # gather children of the selected summary as next candidates
+                child_src = up_levels[lvl - 1]
+                groups = child_src.view(bs, -1, b, d)
+                null_group = self.null.expand(bs, b, d).unsqueeze(1)
+                groups = torch.cat([null_group, groups], dim=1)
+                cand = groups[torch.arange(bs).unsqueeze(1), sel]
+                mask = None  # children tile parent's past range: always safe
+                parent = sel
+
+        # fine fanout: expand the top-m level-1 summaries to level-0 blocks.
+        # block_map index: 0 = null block; 1+g = level-0 block g.
+        ns1 = up_levels[0].shape[1]
+        null_block = self.null.expand(bs, b, d).unsqueeze(1)
+        block_map = torch.cat([null_block, x.view(bs, ns1, b, d)], dim=1)
+        base = torch.where(parent == 0,
+                           torch.zeros_like(parent),
+                           (parent - 1) * b + 1)
+        fine_idx = torch.where((parent == 0).unsqueeze(-1),
+                               torch.zeros_like(topm),
+                               base.unsqueeze(-1) + topm)  # (bs, n, m)
+        fine_keys = block_map[torch.arange(bs).view(bs, 1, 1), fine_idx]
+        fine_keys = fine_keys.reshape(bs, n, -1, d)
+
+        qf = self.fine.wq(self.ln(x)).view(bs, n, self.h, -1).transpose(1, 2)
+        fk, fv = self.fine.wkv(fine_keys).chunk(2, dim=-1)
+        hd = qf.shape[-1]
+        fk = fk.view(bs, n, fine_keys.shape[2], self.h, hd)
+        fv = fv.view(bs, n, fine_keys.shape[2], self.h, hd)
+        scores = torch.einsum("bhnd,bnchd->bhnc", qf, fk) / math.sqrt(hd)
+        w = torch.softmax(scores, dim=-1)
+        fctx = torch.einsum("bhnc,bnchd->bnhd", w, fv).reshape(bs, n, d)
+        return x + self.fine.out(ctx + fctx)
+
+
 class MGAModel(nn.Module):
     def __init__(self, vocab, n, d=256, h=4, b=16, kq=1, cycles=2, shared=True,
-                 posxattn=False, shift=False, fp32read=False, poolaux=False):
+                 posxattn=False, shift=False, fp32read=False, poolaux=False,
+                 read_mode="dense", amr_m=4):
         super().__init__()
         assert b % kq == 0, "kq must divide b"
+        if read_mode == "amr":
+            assert kq == 1 and not shift, "AMR read requires kq=1 and no shift"
         m, n_levels = n, 0
         while m > b:
             assert m % b == 0, f"sequence length {n} not coarsenable by b={b}"
             m = m * kq // b
             n_levels += 1
+        if read_mode == "amr":
+            assert n_levels >= 2, f"AMR read needs >=2 summary levels (n={n} too small)"
         self.b, self.kq, self.cycles, self.shared = b, kq, cycles, shared
         self.posxattn, self.shift = posxattn, (b // 2 if shift else 0)
         self.poolaux = poolaux
+        self.read_mode = read_mode
         self.vocab = vocab
         self.emb = nn.Embedding(vocab, d)
         nn.init.normal_(self.emb.weight, std=0.02)
@@ -245,6 +341,8 @@ class MGAModel(nn.Module):
         self.rope = RoPE(d // h, max(n, 8192))
         if poolaux:
             self.poolaux_head = nn.Linear(d, vocab)
+        if read_mode == "amr":
+            self.amrread = AMRRead(d, h, m=amr_m)
         if shared:
             self.block = Block(d, h, self.rope)
             self.pool = Pool(d, h, kq, fp32read)
@@ -318,7 +416,11 @@ class MGAModel(nn.Module):
             l += 1
         hier[-1] = self._get("top")(hier[-1], None)
         for l in reversed(range(len(hier) - 1)):
-            hier[l] = self._get(f"read_{l}")(hier[l], hier[l + 1], covers[l], rope=rope)
+            if l == 0 and self.read_mode == "amr":
+                hier[0] = self.amrread(hier[0], hier[1:], covers)
+            else:
+                hier[l] = self._get(f"read_{l}")(hier[l], hier[l + 1],
+                                                covers[l], rope=rope)
             hier[l] = self._apply_block(self._get(f"post_{l}"), hier[l],
                                         shift if l == 0 else 0)
         return hier[0], auxes

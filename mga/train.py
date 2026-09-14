@@ -46,7 +46,8 @@ def build(args, n=None, d=None, device="cpu"):
                      posxattn=getattr(args, "posxattn", False),
                      shift=getattr(args, "shift", False),
                      fp32read=getattr(args, "fp32read", False),
-                     poolaux=getattr(args, "poolaux", False))
+                     poolaux=getattr(args, "poolaux", False),
+                     read_mode="amr" if getattr(args, "amr", False) else "dense")
     else:
         m = BaselineModel(data.VOCAB, n, mode=args.model, d=d, h=args.heads,
                           depth=args.depth, window=args.b)
@@ -109,6 +110,7 @@ def leak_test():
     variants = [
         ("mga", dict(model="mga", k=1, shift=False, posxattn=False)),
         ("mga_shift_k4_posx", dict(model="mga", k=4, shift=True, posxattn=True)),
+        ("mga_amr", dict(model="mga", k=1, shift=False, posxattn=False, amr=True)),
         ("full", dict(model="full", k=1, shift=False, posxattn=False)),
         ("local", dict(model="local", k=1, shift=False, posxattn=False)),
     ]
@@ -345,6 +347,8 @@ def main():
                     help="v0.1: positional encoding on Pool/Read cross-attention")
     ap.add_argument("--exitloss", action="store_true",
                     help="v0.1: per-cycle exit loss with increasing weights (mga only)")
+    ap.add_argument("--amr", action="store_true",
+                    help="v0.2: AMR read (tree descent + fine fanout) at level 0")
     ap.add_argument("--tag", default=None)
     ap.add_argument("--eval_only", action="store_true",
                     help="load --resume checkpoint, eval once at args.n/--cycles, exit")
