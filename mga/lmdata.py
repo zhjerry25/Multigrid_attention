@@ -50,7 +50,17 @@ def _load(split):
     if split not in _cache:
         _ensure()
         with open(FILE, "rb") as f:
-            raw = torch.frombuffer(f.read(), dtype=torch.uint8)
+            buf = f.read()
+        if buf[:4] == b"PK\x03\x04":  # uploaded the zip instead of the raw file
+            import io
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(buf)) as z:
+                buf = z.read("enwik8")
+        if len(buf) != TOTAL:
+            raise RuntimeError(
+                f"{FILE} has {len(buf):,} bytes, expected {TOTAL:,} -- "
+                "truncated upload or wrong file (upload the extracted enwik8)")
+        raw = torch.frombuffer(bytearray(buf), dtype=torch.uint8)
         lo, hi = RANGES[split]
         _cache[split] = raw[lo:hi].long()
     return _cache[split]
