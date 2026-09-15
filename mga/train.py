@@ -323,6 +323,25 @@ def train(args, device):
                            eval_digit=round(sum(pds) / len(pds), 4))
                 if args.task == "lm":
                     rec["bpc"] = round(sum(lss) / len(lss) / 0.6931, 4)
+                    # per-position loss by index mod b: is the gap at block
+                    # boundaries (starved for cross-block info) or uniform
+                    # (capacity-bound)?
+                    with torch.no_grad(), amp_ctx(args, device):
+                        idx, tgt, mask, _ = make_batch(args, g_eval, device,
+                                                     split="val")
+                        lgs = model(idx)
+                        lgs = lgs[0] if isinstance(lgs, tuple) else lgs
+                        if isinstance(lgs, list):
+                            lgs = lgs[-1]
+                        ce = F.cross_entropy(
+                            lgs.reshape(-1, lgs.shape[-1]).float(),
+                            tgt.reshape(-1), reduction="none")
+                        ce = ce.view(tgt.shape[0], tgt.shape[1]).mean(0)
+                        bb = args.b
+                        rec["posloss_mod_b"] = [
+                            round(x, 3)
+                            for x in ce.view(-1, bb).mean(0).div(0.6931).tolist()
+                        ]
                 if poss:
                     h, p = torch.cat(hits).float(), torch.cat(poss)
                     depth = []
