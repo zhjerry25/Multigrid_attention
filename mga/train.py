@@ -56,7 +56,8 @@ def build(args, n=None, d=None, device="cpu"):
                                 else "sparse" if getattr(args, "sparse", False)
                                 else "dense"),
                      read_m=getattr(args, "read_m", 64),
-                     read_mf=getattr(args, "read_mf", 4))
+                     read_mf=getattr(args, "read_mf", 4),
+                     halo=getattr(args, "halo", False))
     else:
         m = BaselineModel(vocab, n, mode=args.model, d=d, h=args.heads,
                           depth=args.depth, window=args.b)
@@ -140,6 +141,7 @@ def leak_test():
         ("mga_shift_k4_posx", dict(model="mga", k=4, shift=True, posxattn=True)),
         ("mga_amr", dict(model="mga", k=1, shift=False, posxattn=False, amr=True)),
         ("mga_sparse", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True)),
+        ("mga_halo", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True)),
         ("full", dict(model="full", k=1, shift=False, posxattn=False)),
         ("local", dict(model="local", k=1, shift=False, posxattn=False)),
     ]
@@ -414,6 +416,8 @@ def main():
     ap.add_argument("--read_m", type=int, default=64, help="sparse read top-m")
     ap.add_argument("--read_mf", type=int, default=4, help="sparse read fine fanout")
     ap.add_argument("--nqueries", type=int, default=4, help="mqar queries per sequence")
+    ap.add_argument("--halo", action="store_true",
+                    help="v0.4: halo smoothing (prev-block ++ cur-block keys, 2b window)")
     ap.add_argument("--resume_weights_only", default="",
                     help="lenient weight resume (fresh opt/schedule, step 0)")
     ap.add_argument("--tag", default=None)

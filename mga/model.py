@@ -46,6 +46,14 @@ def causal_mask(t, device):
     return torch.tril(torch.ones(t, t, dtype=torch.bool, device=device))
 
 
+def halo_mask(b, device):
+    """Halo window (2b): in-block query q attends keys k <= b + q (its own
+    position in the window). Previous block is fully visible."""
+    i = torch.arange(b, device=device).unsqueeze(1)
+    j = torch.arange(2 * b, device=device).unsqueeze(0)
+    return j <= (b + i)
+
+
 def run_chunked(fn, x, chunk=FOLD_CHUNK):
     """Apply fn (batch-first) to x in row chunks; keeps CUDA grid dims safe."""
     if x.shape[0] <= chunk:
@@ -95,6 +103,23 @@ class Attn(nn.Module):
             o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.out(o.transpose(1, 2).reshape(b, t, c))
 
+    def forward_halo(self, q_x, kv_x, mask):
+        """Attention with queries from q_x and keys/values from a longer
+        window kv_x (prev block ++ current block). RoPE: keys at window
+        positions 0..tk-1, queries at tk-tq..tk-1 (relative offsets exact)."""
+        b, tq, c = q_x.shape
+        tk = kv_x.shape[1]
+        q = self.qkv(q_x).chunk(3, dim=-1)[0]
+        k, v = self.qkv(kv_x).chunk(3, dim=-1)[1:]
+        q = q.view(b, tq, self.h, -1).transpose(1, 2)
+        k = k.view(b, tk, self.h, -1).transpose(1, 2)
+        v = v.view(b, tk, self.h, -1).transpose(1, 2)
+        dev = q_x.device
+        q = self.rope.rotate(q, torch.arange(tk - tq, tk, device=dev))
+        k = self.rope.rotate(k, torch.arange(tk, device=dev))
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        return self.out(o.transpose(1, 2).reshape(b, tq, c))
+
 
 class Block(nn.Module):
     """Pre-norm transformer block: self-attention (masked) + MLP."""
@@ -108,6 +133,13 @@ class Block(nn.Module):
 
     def forward(self, x, mask):
         x = x + self.attn(self.ln1(x), mask)
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+    def forward_halo(self, q_x, kv_x, mask):
+        """Same block, but attention queries come from q_x and keys/values
+        from the wider window kv_x (shared projections, shared LN)."""
+        x = q_x + self.attn.forward_halo(self.ln1(q_x), self.ln1(kv_x), mask)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -417,7 +449,7 @@ class SparseRead(nn.Module):
 class MGAModel(nn.Module):
     def __init__(self, vocab, n, d=256, h=4, b=16, kq=1, cycles=2, shared=True,
                  posxattn=False, shift=False, fp32read=False, poolaux=False,
-                 read_mode="dense", amr_m=4, read_m=64, read_mf=4):
+                 read_mode="dense", amr_m=4, read_m=64, read_mf=4, halo=False):
         super().__init__()
         assert b % kq == 0, "kq must divide b"
         if read_mode == "amr":
@@ -429,10 +461,12 @@ class MGAModel(nn.Module):
             n_levels += 1
         if read_mode == "amr":
             assert n_levels >= 2, f"AMR read needs >=2 summary levels (n={n} too small)"
+        assert not (halo and shift), "halo + shift unsupported"
         self.b, self.kq, self.cycles, self.shared = b, kq, cycles, shared
         self.posxattn, self.shift = posxattn, (b // 2 if shift else 0)
         self.poolaux = poolaux
         self.read_mode = read_mode
+        self.halo = halo
         self.vocab = vocab
         self.emb = nn.Embedding(vocab, d)
         nn.init.normal_(self.emb.weight, std=0.02)
@@ -487,6 +521,31 @@ class MGAModel(nn.Module):
             parts.append(blk(s[:, t - rem:], causal_mask(rem, s.device)))
         return torch.cat(parts, dim=1)
 
+    def _apply_block_halo(self, blk, s):
+        """Halo smoothing: keys = previous block ++ current block (2b window).
+        Block 0 runs plain block-causal (no past exists)."""
+        bs, t, c = s.shape
+        b = self.b
+        if t <= b:
+            return blk(s, None)
+        xb = s.view(bs, -1, b, c)
+        first = blk(xb[:, 0], causal_mask(b, s.device)).unsqueeze(1)
+        if xb.shape[1] == 1:
+            return first.view(bs, t, c)
+        rest, prev = xb[:, 1:], xb[:, :-1]
+        kv = torch.cat([prev, rest], dim=2).reshape(bs * rest.shape[1], 2 * b, c)
+        q = rest.reshape(bs * rest.shape[1], b, c)
+        mask = halo_mask(b, s.device)
+        outs = [blk.forward_halo(qi, kvi, mask)
+                for qi, kvi in zip(q.split(FOLD_CHUNK), kv.split(FOLD_CHUNK))]
+        out = torch.cat(outs, dim=0)
+        return torch.cat([first, out.view(bs, -1, b, c)], dim=1).view(bs, t, c)
+
+    def _smooth(self, blk, s, shift=0):
+        if self.halo:
+            return self._apply_block_halo(blk, s)
+        return self._apply_block(blk, s, shift)
+
     def _bow_aux(self, summaries, cover_end, idx):
         """BCE on level-0 summaries predicting the bag-of-words of the block
         they cover. Direct dense gradient to Pool (breaks chicken-and-egg)."""
@@ -509,7 +568,7 @@ class MGAModel(nn.Module):
         s, l = s0, 0
         while s.shape[1] > b:
             sh = shift if l == 0 else 0
-            s = self._apply_block(self._get(f"smooth_{l}"), s, sh)
+            s = self._smooth(self._get(f"smooth_{l}"), s, sh)
             s, cover_end = self._get(f"pool_{l}")(s, b, rope=rope, shift=sh)
             if l == 0 and idx is not None:
                 auxes.append(self._bow_aux(s, cover_end, idx))
@@ -525,8 +584,8 @@ class MGAModel(nn.Module):
             else:
                 hier[l] = self._get(f"read_{l}")(hier[l], hier[l + 1],
                                                 covers[l], rope=rope)
-            hier[l] = self._apply_block(self._get(f"post_{l}"), hier[l],
-                                        shift if l == 0 else 0)
+            hier[l] = self._smooth(self._get(f"post_{l}"), hier[l],
+                                   shift if l == 0 else 0)
         return hier[0], auxes
 
     def forward(self, idx, all_cycles=False):
