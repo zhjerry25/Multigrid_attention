@@ -1,13 +1,16 @@
 """Train/eval driver for MGA and baselines.
 
 Usage:
-  python -m mga.train --selftest
-  python -m mga.train --model mga --n 4096 --cycles 2 --k 4 --shift \
-      --steps 4000 --bs 256 --lr 1e-3 --exitloss --posxattn --ema 0.999 \
-      --bf16 --fp32read --poolaux --curr 512,1024,2048,4096 \
-      --save runs/ck.pt --ckpt_every 1000
-  python -m mga.train --model local --n 4096
-  python -m mga.train --model full --n 4096 --bf16   # flash path on CUDA
+  python -m mga.train --selftest          # leak tests (must be 0 diff) + overfit
+  # synthetic: ignite small, transfer big
+  python -m mga.train --model mga --task passkey --n 512 --cycles 2 --sparse \
+      --steps 3000 --bs 64 --lr 1e-3 --save runs/stage512.pt
+  python -m mga.train --model mga --task passkey --n 4096 --cycles 2 --sparse \
+      --eval_only --resume runs/stage512.pt
+  # enwik8 LM (needs data/enwik8): direct cold start with halo smoothing
+  python -m mga.train --model mga --task lm --n 4096 --cycles 2 --sparse --halo \
+      --steps 15000 --bs 32 --lr 1e-3 --save runs/lm.pt
+  python -m mga.train --model full --task lm --n 4096 --bf16  # flash path on CUDA
 """
 import argparse
 import contextlib

@@ -1,37 +1,26 @@
-"""MGA v0.2: causal multigrid V-cycle transformer with AMR read path.
+"""MGA: causal multigrid V-cycle transformer.
 
-One V-cycle = bottom-up smoothing + learned pooling (restriction),
-full-causal solve at the top level, then top-down cross-attention read
-(prolongation) + post-smoothing. The same operator (Block/Pool/Read) is
-shared across all levels and all cycles unless `shared=False`.
+One V-cycle = halo block-causal smoothing (keys = prev ++ current block)
++ learned pooling (restriction) up a regular summary tree + full-causal
+solve at the top + top-down read (prolongation) + post-smoothing, repeated
+for T cycles. A single operator (Block/Pool/Read) is shared across all
+levels and all cycles unless `shared=False`; parameters do not depend on
+sequence length, which is what enables zero-shot length transfer.
 
-Causality rule: a summary may be read by token i only if every token it
-covers is < i. Tracked explicitly via cover_end per summary (one past the
-last covered position, in that level's coordinates).
+Causality: a summary may be read by token i only if every token it covers
+is < i, tracked via cover_end per summary (one past the last covered
+position, in that level's coordinates). Any change to an attention path
+must keep the leak test at 0 diff.
 
-v0.2 (AMR read, read_mode="amr"): replaces the level-0 dense summary read
-O(n^2/b^2) with a batched top-down tree descent + fine-grained fanout:
-  1. beam descent: score candidate summaries level by level (top-1 argmax
-     selects the children forming the next candidate set), softmax weights
-     give a per-level coarse context;
-  2. final top-m fanout: the m winning level-1 summaries are expanded to
-     their raw level-0 tokens for a token-level fine read;
-  3. per-token keys: b*log_b(n) beam + m*b fine + b local -> O(n*b*log n).
-Children always tile their parent's cover range, so cover_end(parent) <= i
-implies cover_end(child) <= i: descent is causally safe by construction
-(only the top candidate set needs a cover_end mask). Selection indices are
-detached (argmax/topk); gradients flow through the softmax weights and the
-fine attention (MoBA/NSA convention). Higher levels keep the dense Read.
+Level-0 read modes (`read_mode`): "dense" (all past summaries),
+"sparse" (production: block-shared global top-m selection + top-mf
+raw-block fanout, O(n*m) read), "amr" (rejected tree-descent variant,
+kept for audit). Other rejected audit flags (default off, verdicts in
+topic.md): kq>1, shift, posxattn, fp32read, poolaux, exitloss.
 
-v0.1 additions (audit trail, all default OFF -- verdicts in topic.md):
-kq>1 bandwidth, shifted blocking (TOXIC at 512), posxattn (rejected),
-fp32read (moot: bf16 innocent), poolaux (useless at 4096), exitloss (TOXIC).
-Production recipe: bare config + curriculum ignition (ignite at 512, then
-run at target n; see topic.md).
-
-CUDA note: folded-block batches are chunked to 8192 rows per attention call
-(some SDPA backends exceed the CUDA grid y-limit at 65536 rows), and
-CrossAttn uses manual matmul attention.
+CUDA note: folded-block batches are chunked to FOLD_CHUNK rows per
+attention call (some SDPA backends exceed the CUDA grid y-limit at
+65536 rows), and CrossAttn uses manual matmul attention.
 """
 import math
 
@@ -253,7 +242,11 @@ class Read(nn.Module):
 
 
 class AMRRead(nn.Module):
-    """Prolongation (AMR): batched top-down tree descent + top-m fine fanout.
+    """REJECTED (audit only): tree-descent read. Greedy descent let the
+    scorer's learning be held hostage by its own selections (beam myopia);
+    SparseRead's global selection won. Kept behind read_mode="amr".
+
+    Batched top-down tree descent + top-m fine fanout.
 
     Per token: b*log_b(n) beam keys + m*b fine keys -> O(n*b*log n) total.
     Requires kq=1, no shift, >=2 summary levels (regular b-ary tree).
