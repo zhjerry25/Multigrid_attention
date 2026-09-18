@@ -369,6 +369,14 @@ def train(args, device):
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
+            if (args.stop_exact is not None
+                    and rec.get("eval_exact", 0) >= args.stop_exact):
+                if args.save:
+                    save_ckpt(args.save, model, opt, ema, args, step)
+                print(f"[early-stop] eval_exact {rec['eval_exact']} >= "
+                      f"{args.stop_exact} at step {step}, saved", flush=True)
+                log.close()
+                return
             if backup is not None:
                 model.load_state_dict(backup)
     if args.save:
@@ -421,6 +429,8 @@ def main():
     ap.add_argument("--read_mf", type=int, default=4, help="sparse read fine fanout")
     ap.add_argument("--nqueries", type=int, default=4, help="mqar queries per sequence")
     ap.add_argument("--npairs", type=int, default=16, help="mqar pairs per sequence")
+    ap.add_argument("--stop_exact", type=float, default=None,
+                    help="early stop + save when eval_exact >= this (0..1)")
     ap.add_argument("--halo", action="store_true",
                     help="v0.4: halo smoothing (prev-block ++ cur-block keys, 2b window)")
     ap.add_argument("--resume_weights_only", default="",

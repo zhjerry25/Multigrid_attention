@@ -41,7 +41,9 @@ def main():
                     default=[128, 256, 512, 1024, 2048, 4096, 8192, 16384])
     ap.add_argument("--threshold", type=float, default=0.99,
                     help="zero-shot eval_exact >= threshold -> skip training")
-    ap.add_argument("--steps", type=int, default=4000)
+    ap.add_argument("--steps", type=int, default=4000, help="steps per attempt")
+    ap.add_argument("--max_steps", type=int, default=12000,
+                    help="per-rung cap for top-up training until threshold")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--resume_lr_scale", type=float, default=0.1,
                     help="lr multiplier when resuming a transferred ckpt "
@@ -85,17 +87,28 @@ def main():
         lr = args.lr if ckpt is None else args.lr * args.resume_lr_scale
         new_ckpt = f"runs/stress_{tag}_n{n}.pt"
         logf = f"runs/stress_{tag}_n{n}.log"
-        cmd = base_cmd(n) + ["--steps", str(args.steps), "--bs", str(bs),
-                             "--lr", str(lr), "--save", new_ckpt,
-                             "--tag", f"stress_{tag}_n{n}"]
-        if ckpt:
-            cmd += ["--resume_weights_only", ckpt]
-        run(cmd, logf)
-        post = eval_ckpt(n, new_ckpt)
+        total = 0
+        while True:
+            total += args.steps
+            cmd = base_cmd(n) + ["--steps", str(total), "--bs", str(bs),
+                                 "--lr", str(lr), "--save", new_ckpt,
+                                 "--tag", f"stress_{tag}_n{n}",
+                                 "--stop_exact", str(args.threshold)]
+            if total > args.steps:
+                cmd += ["--resume", new_ckpt]  # top-up: continue own run
+            elif ckpt:
+                cmd += ["--resume_weights_only", ckpt]  # first attempt: transfer
+            run(cmd, logf)
+            post = eval_ckpt(n, new_ckpt)
+            got = post.get("eval_exact", 0)
+            print(f"[stress] n={n}: eval_exact {got:.3f} after {total} steps",
+                  flush=True)
+            if got >= args.threshold or total >= args.max_steps:
+                break
+            print(f"[stress] n={n}: below threshold, topping up to "
+                  f"{total + args.steps} steps", flush=True)
         ckpt = new_ckpt
-        print(f"[stress] n={n}: trained -> {post.get('eval_exact')}", flush=True)
-        rows.append((n, zs.get("eval_exact") if zs else None,
-                     post.get("eval_exact"), "trained"))
+        rows.append((n, zs.get("eval_exact") if zs else None, got, "trained"))
 
     print("\n# summary", flush=True)
     print("| n | zero-shot | trained | action |", flush=True)
