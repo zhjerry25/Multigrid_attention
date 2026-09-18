@@ -11,20 +11,20 @@ passkey: filler with a needle [P, d1..d5] at a random position and
 copying: [pattern c tokens][SEP][filler][SEP][pattern]; loss on last c.
 
 mqar: n_pairs key->value pairs [(k_i, v_i)] spaced through filler, then
-[Q, k, v] x n_queries at the end; loss on the query values. Keys are 16
-dedicated tokens (10-25) sampled WITHOUT replacement (a permutation per
-sequence) -- an earlier version drew 16 pairs from 8 keys with replacement,
-making targets contradictory (same key, different values) and freezing the
-loss at ln(10). Fillers are 26-29 for this task only (passkey/copying
-keep 18-29); values are digits.
+[Q, k, v] x n_queries at the end; loss on the query values. Keys are 64
+dedicated tokens (34-97) sampled WITHOUT replacement (a permutation per
+sequence) -- an earlier version drew pairs with replacement from too few
+keys, making targets contradictory (same key, different values) and
+freezing the loss at ln(10). Fillers are 26-29 for this task only
+(passkey/copying keep 18-29); values are digits.
 """
 import torch
 
 FILL0, FILL1 = 18, 30  # filler tokens 18..29 (passkey/copying)
 P, Q, SEP = 30, 31, 32
-VOCAB = 34
+VOCAB = 128  # 0-9 digits, 18-29 filler, 30-32 P/Q/SEP, 34-97 MQAR keys
 KEY = 5
-MQAR_KEYS = list(range(10, 26))  # 16 distinct keys
+MQAR_KEYS = list(range(34, 98))  # 64 distinct keys (npairs <= 64)
 MQAR_FILL0, MQAR_FILL1 = 26, 30  # mqar-only fillers (26..29)
 
 
@@ -66,12 +66,14 @@ def copying_batch(bs, n, g, device, c=None):
 
 
 def mqar_batch(bs, n, g, device, n_pairs=16, n_queries=4):
+    assert n_pairs <= len(MQAR_KEYS), \
+        f"n_pairs={n_pairs} > {len(MQAR_KEYS)} distinct keys"
     tail = 3 * n_queries
     seq = torch.randint(MQAR_FILL0, MQAR_FILL1, (bs, n + 1), generator=g)
     seg = (n + 1 - tail) // n_pairs
     assert seg >= 2, "sequence too short for n_pairs"
     ki = torch.argsort(torch.rand(bs, len(MQAR_KEYS), generator=g), dim=1)[:, :n_pairs]
-    keys = 10 + ki  # unique keys per sequence (no-replacement permutation)
+    keys = MQAR_KEYS[0] + ki  # unique keys per sequence (no-replacement)
     vals = torch.randint(0, 10, (bs, n_pairs), generator=g)
     off = torch.randint(0, seg - 1, (bs, n_pairs), generator=g)
     p = torch.arange(n_pairs).unsqueeze(0) * seg + off  # (bs, n_pairs)
