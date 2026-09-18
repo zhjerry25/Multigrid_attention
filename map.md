@@ -107,3 +107,28 @@ n ∈ {512, 1k, 2k, 4k, 8k, 16k, 32k, 65k}，512 点火后逐级 `--resume_weigh
 - **KV 引擎 bug 风险**：等价性测试是硬门；不过就缩小 demo 到 passkey 生成
 - **外推若在 65k 崩**：报告到 16k/32k 为止并分析失效形态，不遮掩
 - Parking lot（不做但记录）：不动点训练（复活 T 旋钮）、AMR 树下降（已否决）、层级选择（>1M）、PG-19 全量、word-level tokenizer 对比
+
+## 11. 论文版面设计（2026-09-18）
+
+**版面原则：最强的证据放最前面，我们独有别人没有的能力做杀手图。**
+
+### 正文
+
+| 位置 | 内容 | 数据 |
+|---|---|---|
+| Fig 1 | 架构图（V-cycle + 层级树 + SparseRead） | 手绘 |
+| **Fig 2（杀手图）** | **零样本迁移阶梯**：单个 ckpt × n ∈ {128…65k} 的 exact 曲线；full/local/linear 对照组在此图**无法出现**（无迁移能力=不存在曲线）——缺席本身就是证据 | stress 阶梯（MQAR 128→8192 零样本 ~1.0 已实证；passkey 同法） |
+| Fig 3 | LM 主表 + bpc-vs-n 外推曲线 | enwik8（已有）+ PG-19 子集 |
+| Fig 4 | 循环分析：cycles_exact 分担 + T∈{1,2,4} 容量-bpc 曲线 | LM T1/T2 已存；T=4 训练待跑 |
+| Fig 5 | 标度与性能：FLOPs/显存/tok-s/生成延迟 vs n（mga 平线 vs full 爆炸） | 公式表 + 日志 + KV 引擎 demo |
+| Table 2 | 消融（A1-A6） | 阶段 3 |
+
+### 附录
+
+点火现象学（SNR 证据链 R2/R3/g）、训练细节与超参表、否决方案简记（AMR/shift/exitloss/poolaux/posxattn）、预训练 demo（Pile/TinyStories 切片）、stress 阶梯全量表。
+
+### 基线安置逻辑（哪里证明我们强）
+
+- **检索任务（Fig 2 + §4）**：full = 质量上界（我们以线性成本打平）；local/linear/XL = 反例（随 n 崩或无法迁移）；**对照组在迁移图上的缺席即我们的胜利**
+- **LM（Fig 3）**：full-d8 = 质量天花板（诚实不打，说明定位）；full-d2 = 参数匹配对手（我们反超 1.556 vs 1.664）；**赢面在 bpc-vs-n 与 bpc-vs-FLOPs 前沿**，不在单点
+- **系统（Fig 5）**：full 的生成成本随 n 线性爬，我们平线——KV cache demo 的直接视觉证据

@@ -43,6 +43,9 @@ def main():
                     help="zero-shot eval_exact >= threshold -> skip training")
     ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--resume_lr_scale", type=float, default=0.1,
+                    help="lr multiplier when resuming a transferred ckpt "
+                         "(forgetting guard: L3 lesson — normal lr destroys it)")
     ap.add_argument("--cycles", type=int, default=2)
     ap.add_argument("--tag", default=None)
     args = ap.parse_args()
@@ -79,10 +82,11 @@ def main():
             rows.append((n, zs["eval_exact"], None, "zero-shot"))
             continue
         bs = 64 if n <= 1024 else 32
+        lr = args.lr if ckpt is None else args.lr * args.resume_lr_scale
         new_ckpt = f"runs/stress_{tag}_n{n}.pt"
         logf = f"runs/stress_{tag}_n{n}.log"
         cmd = base_cmd(n) + ["--steps", str(args.steps), "--bs", str(bs),
-                             "--lr", str(args.lr), "--save", new_ckpt,
+                             "--lr", str(lr), "--save", new_ckpt,
                              "--tag", f"stress_{tag}_n{n}"]
         if ckpt:
             cmd += ["--resume_weights_only", ckpt]
