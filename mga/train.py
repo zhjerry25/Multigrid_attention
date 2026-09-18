@@ -85,6 +85,7 @@ def make_batch(args, g, device, n=None, split="train"):
         return lmdata.lm_batch(args.bs, n or args.n, g, device, split=split)
     if args.task == "mqar":
         return data.mqar_batch(args.bs, n or args.n, g, device,
+                               n_pairs=getattr(args, "npairs", 16),
                                n_queries=getattr(args, "nqueries", 4))
     return BATCHERS[args.task](args.bs, n or args.n, g, device)
 
@@ -419,6 +420,7 @@ def main():
     ap.add_argument("--read_m", type=int, default=64, help="sparse read top-m")
     ap.add_argument("--read_mf", type=int, default=4, help="sparse read fine fanout")
     ap.add_argument("--nqueries", type=int, default=4, help="mqar queries per sequence")
+    ap.add_argument("--npairs", type=int, default=16, help="mqar pairs per sequence")
     ap.add_argument("--halo", action="store_true",
                     help="v0.4: halo smoothing (prev-block ++ cur-block keys, 2b window)")
     ap.add_argument("--resume_weights_only", default="",
