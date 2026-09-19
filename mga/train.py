@@ -60,7 +60,8 @@ def build(args, n=None, d=None, device="cpu"):
                                 else "dense"),
                      read_m=getattr(args, "read_m", 64),
                      read_mf=getattr(args, "read_mf", 4),
-                     halo=getattr(args, "halo", False))
+                     halo=getattr(args, "halo", False),
+                     qdelta=getattr(args, "qdelta", False))
     else:
         m = BaselineModel(vocab, n, mode=args.model, d=d, h=args.heads,
                           depth=args.depth, window=args.b)
@@ -146,6 +147,7 @@ def leak_test():
         ("mga_amr", dict(model="mga", k=1, shift=False, posxattn=False, amr=True)),
         ("mga_sparse", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True)),
         ("mga_halo", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True)),
+        ("mga_qdelta", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True, qdelta=True)),
         ("full", dict(model="full", k=1, shift=False, posxattn=False)),
         ("local", dict(model="local", k=1, shift=False, posxattn=False)),
     ]
@@ -433,6 +435,8 @@ def main():
                     help="early stop + save when eval_exact >= this (0..1)")
     ap.add_argument("--halo", action="store_true",
                     help="v0.4: halo smoothing (prev-block ++ cur-block keys, 2b window)")
+    ap.add_argument("--qdelta", action="store_true",
+                    help="v0.6 B1: coarse-to-fine query delta (zero-init gate)")
     ap.add_argument("--resume_weights_only", default="",
                     help="lenient weight resume (fresh opt/schedule, step 0)")
     ap.add_argument("--tag", default=None)

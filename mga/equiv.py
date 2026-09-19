@@ -80,6 +80,41 @@ def check(path, tol):
     return ok_all
 
 
+def check_qdelta(path, tol):
+    """B1: sparse_halo_T2 with qdelta=True. The coarse gate is zero-init, so
+    the function must be identical to the dump; only the two new params may
+    be missing from the reference state_dict."""
+    ref = torch.load(path, map_location="cpu")
+    r = ref["sparse_halo_T2"]
+    kw = dict(CONFIGS["sparse_halo_T2"], qdelta=True)
+    torch.manual_seed(1234)
+    model = MGAModel(VOCAB, N, d=D, h=H, b=B, kq=KQ, **kw).eval()
+    missing, unexpected = model.load_state_dict(r["state_dict"], strict=False)
+    print(f"[qdelta] missing keys: {sorted(missing)}")
+    print(f"[qdelta] unexpected keys: {sorted(unexpected)}")
+    assert sorted(missing) == sorted(
+        ["sparseread.q_delta.weight", "sparseread.coarse_gate"]), missing
+    assert not unexpected, unexpected
+    out_last, out_all, loss, _ = run(model, r["idx"], r["tgt"])
+    # compare grads only over params present in the reference (the two new
+    # params have exact-zero grads at gate=0 and are excluded)
+    grads = torch.cat([p.grad.reshape(-1) for n, p in model.named_parameters()
+                       if p.grad is not None and n in r["state_dict"]])
+    assert len(out_all) == len(r["out_all"])
+    diffs = [("out_last", (out_last - r["out_last"]).abs().max().item())]
+    diffs += [(f"out_all[{t}]", (a - b).abs().max().item())
+              for t, (a, b) in enumerate(zip(out_all, r["out_all"]))]
+    diffs.append(("loss", abs(loss.item() - r["loss"].item())))
+    diffs.append(("grads", (grads - r["grads"]).abs().max().item()))
+    worst = max(v for _, v in diffs)
+    ok = worst <= tol
+    print(f"[sparse_halo_T2+qdelta] "
+          + "  ".join(f"{k}={v:.3e}" for k, v in diffs))
+    print(f"[sparse_halo_T2+qdelta] worst={worst:.3e} tol={tol:.1e} -> "
+          f"{'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     mode = ap.add_mutually_exclusive_group(required=True)
@@ -89,9 +124,14 @@ def main():
                       help="compare current code against the dumped reference")
     ap.add_argument("--tol", type=float, default=1e-6)
     ap.add_argument("--path", default="tmp/equiv_ref.pt")
+    ap.add_argument("--qdelta", action="store_true",
+                    help="check sparse_halo_T2 with qdelta=True (zero-init "
+                         "gate => identical function, strict=False load)")
     args = ap.parse_args()
     if args.dump:
         dump(args.path)
+    elif args.qdelta:
+        raise SystemExit(0 if check_qdelta(args.path, args.tol) else 1)
     elif check(args.path, args.tol):
         raise SystemExit(0)
     else:

@@ -348,13 +348,19 @@ class SparseRead(nn.Module):
     Falls back to the dense Read as m -> n/b. Causality: a block's candidate
     summaries must satisfy cover_end <= block start (same rule as dense)."""
 
-    def __init__(self, d, h, m=64, mf=4):
+    def __init__(self, d, h, m=64, mf=4, qdelta=False):
         super().__init__()
         self.h, self.m, self.mf = h, m, mf
         self.ln = nn.LayerNorm(d)
         self.scorer = CrossAttn(d, h)
         self.fine = CrossAttn(d, h)
         self.null = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        if qdelta:
+            self.q_delta = nn.Linear(d, d, bias=False)
+            nn.init.zeros_(self.q_delta.weight)
+            self.coarse_gate = nn.Parameter(torch.zeros(()))
+        else:
+            self.q_delta = None
 
     def forward(self, x, summaries, cover_end):
         bs, n, d = x.shape
@@ -410,7 +416,10 @@ class SparseRead(nn.Module):
         fV = map_V[rows, fidx].reshape(bs, nb, mf * b, d)
         fKh = fK.view(bs, nb, mf * b, self.h, hd)
         fVh = fV.view(bs, nb, mf * b, self.h, hd)
-        qf = self.fine.wq(x_ln).view(bs, nb, b, self.h, hd)
+        qf = self.fine.wq(x_ln)
+        if self.q_delta is not None:
+            qf = qf + self.coarse_gate * self.q_delta(self.ln(ctx))
+        qf = qf.view(bs, nb, b, self.h, hd)
         fatt = torch.einsum("bqzhd,bqmhd->bqhzm", qf, fKh) / math.sqrt(hd)
         fatt = fatt.masked_fill(~fmask.unsqueeze(2).unsqueeze(2), float("-inf"))
         fw = torch.softmax(fatt, dim=-1)
@@ -421,7 +430,8 @@ class SparseRead(nn.Module):
 class MGAModel(nn.Module):
     def __init__(self, vocab, n, d=256, h=4, b=16, kq=1, cycles=2, shared=True,
                  posxattn=False, shift=False, fp32read=False, poolaux=False,
-                 read_mode="dense", amr_m=4, read_m=64, read_mf=4, halo=False):
+                 read_mode="dense", amr_m=4, read_m=64, read_mf=4, halo=False,
+                 qdelta=False):
         super().__init__()
         assert b % kq == 0, "kq must divide b"
         if read_mode == "amr":
@@ -453,7 +463,7 @@ class MGAModel(nn.Module):
         if read_mode == "amr":
             self.amrread = AMRRead(d, h, m=amr_m)
         elif read_mode == "sparse":
-            self.sparseread = SparseRead(d, h, m=read_m, mf=read_mf)
+            self.sparseread = SparseRead(d, h, m=read_m, mf=read_mf, qdelta=qdelta)
         if shared:
             self.block = Block(d, h, self.rope)
             self.pool = Pool(d, h, kq, fp32read)
