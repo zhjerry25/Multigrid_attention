@@ -1,7 +1,16 @@
 #!/bin/bash
 # v0.6 experiment batch: sanity + Phase B (B1 qdelta / B2 split_roles / B3 cycle_unshared)
 # Runs entirely on the v0.6 branch tip — no checkouts needed.
-# Logs: training -> runs/<tag>.jsonl; gate/diag evals -> runs/gate_*.json, runs/diag_*.json
+#
+# RECIPE NOTE (verified 2026-09-19): sparse passkey 512->4096 ZERO-SHOT transfer
+# fails (~0.1) on ANY code version, old or new — at n=512 the candidate count
+# (ns+1 = 33) <= m=64, so top-m selection is a no-op during ignition and the
+# selector's ranking is never trained. The historical recipe ALWAYS continued
+# training at 4096 with a fresh cosine (--resume_weights_only; S2' hit 0.96).
+# Gates below therefore use: ignite@512 -> continue@4096 (fresh cosine) -> eval.
+#
+# Logs: training -> runs/<tag>.jsonl; gate/diag evals -> runs/gate_*.json,
+# runs/diag_*.json
 set -u
 cd "$(dirname "$0")/.."
 
@@ -25,37 +34,37 @@ sys.exit(0 if ok else 1)
 EOF
 }
 
-echo "=== [0/4] sanity: frozen arch on v0.6 tip, canonical 3000-step recipe, 2 seeds ==="
-# NOTE: passkey ignition timing has large trajectory variance (fp rounding +
-# CUDA nondeterminism); only the FINAL exact matters. Expect >=0.9 by step
-# 3000 and ~0.95+ on the 4096 zero-shot; mid-run values at 1500 may straddle
-# 0.5-0.9 across seeds — that spread is normal, not a regression.
-for SEED in 0 1; do
-  $MGA --task passkey --n 512  --cycles 2 --sparse --halo --steps 3000 --bs 64 --lr 1e-3 --seed $SEED --save runs/pk_v06_512_s$SEED.pt --tag pk_v06_512_s$SEED
-  $MGA --task passkey --n 4096 --cycles 2 --sparse --halo --eval_only --resume runs/pk_v06_512_s$SEED.pt | tee runs/gate_v06_s$SEED.json
-done
+# per-variant passkey pipeline: ignite@512 -> continue@4096 (fresh cosine) -> gate+diag
+# usage: pk_gate <label> [extra model flags...]
+pk_gate() {
+  local V=$1; shift
+  $MGA --task passkey --n 512  --cycles 2 --sparse --halo "$@" --steps 3000 --bs 64 --lr 1e-3 --seed 0 \
+       --save runs/pk_${V}_512.pt --tag pk_${V}_512
+  $MGA --task passkey --n 4096 --cycles 2 --sparse --halo "$@" --steps 3000 --bs 32 --lr 1e-3 \
+       --resume_weights_only runs/pk_${V}_512.pt --save runs/pk_${V}_4096.pt --tag pk_${V}_4096
+  $MGA --task passkey --n 4096 --cycles 2 --sparse --halo "$@" --eval_only --resume runs/pk_${V}_4096.pt --diag \
+       | tee runs/gate_${V}.json
+  gate runs/gate_${V}.json 0.5 $V
+}
+
+echo "=== [0/4] sanity: frozen arch, historical S-recipe (expect ~0.9 after 4096 continuation) ==="
+pk_gate v06
 
 echo "=== [1/4] B1: --qdelta (coarse-context rewrite of fine query) ==="
-$MGA --task passkey --n 512  --cycles 2 --sparse --halo --qdelta --steps 3000 --bs 64 --lr 1e-3 --save runs/pk_qdelta512.pt --tag pk_qdelta512
-$MGA --task passkey --n 4096 --cycles 2 --sparse --halo --qdelta --eval_only --resume runs/pk_qdelta512.pt --diag | tee runs/gate_qdelta.json
-if gate runs/gate_qdelta.json 0.5 B1; then
+if pk_gate qdelta --qdelta; then
   $MGA --task lm --n 4096 --cycles 2 --sparse --halo --qdelta --steps 15000 --bs 32 --lr 1e-3 --save runs/lm_qdelta.pt --tag lm_qdelta
   $MGA --task lm --n 4096 --cycles 2 --sparse --halo --qdelta --eval_only --resume runs/lm_qdelta.pt --diag | tee runs/diag_qdelta.json
 fi
 
 echo "=== [2/4] B2: --split_roles (pre/post/top split) + d=352 param-fair control ==="
-$MGA --task passkey --n 512  --cycles 2 --sparse --halo --split_roles --steps 3000 --bs 64 --lr 1e-3 --save runs/pk_roles512.pt --tag pk_roles512
-$MGA --task passkey --n 4096 --cycles 2 --sparse --halo --split_roles --eval_only --resume runs/pk_roles512.pt --diag | tee runs/gate_roles.json
-if gate runs/gate_roles.json 0.5 B2; then
+if pk_gate roles --split_roles; then
   $MGA --task lm --n 4096 --cycles 2 --sparse --halo --split_roles --steps 15000 --bs 32 --lr 1e-3 --save runs/lm_roles.pt --tag lm_roles
   $MGA --task lm --n 4096 --cycles 2 --sparse --halo --d 352 --steps 15000 --bs 32 --lr 1e-3 --save runs/lm_d352.pt --tag lm_d352
   $MGA --task lm --n 4096 --cycles 2 --sparse --halo --split_roles --eval_only --resume runs/lm_roles.pt --diag | tee runs/diag_roles.json
 fi
 
 echo "=== [3/4] B3: --cycle_unshared (per-cycle operator sets) ==="
-$MGA --task passkey --n 512  --cycles 2 --sparse --halo --cycle_unshared --steps 3000 --bs 64 --lr 1e-3 --save runs/pk_cycu512.pt --tag pk_cycu512
-$MGA --task passkey --n 4096 --cycles 2 --sparse --halo --cycle_unshared --eval_only --resume runs/pk_cycu512.pt --diag | tee runs/gate_cycu.json
-if gate runs/gate_cycu.json 0.5 B3; then
+if pk_gate cycu --cycle_unshared; then
   $MGA --task lm --n 4096 --cycles 2 --sparse --halo --cycle_unshared --steps 15000 --bs 32 --lr 1e-3 --save runs/lm_cycu.pt --tag lm_cycu
   $MGA --task lm --n 4096 --cycles 2 --sparse --halo --cycle_unshared --eval_only --resume runs/lm_cycu.pt --diag | tee runs/diag_cycu.json
 fi
