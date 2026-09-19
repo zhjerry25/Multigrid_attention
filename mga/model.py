@@ -92,23 +92,6 @@ class Attn(nn.Module):
             o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.out(o.transpose(1, 2).reshape(b, t, c))
 
-    def forward_halo(self, q_x, kv_x, mask):
-        """Attention with queries from q_x and keys/values from a longer
-        window kv_x (prev block ++ current block). RoPE: keys at window
-        positions 0..tk-1, queries at tk-tq..tk-1 (relative offsets exact)."""
-        b, tq, c = q_x.shape
-        tk = kv_x.shape[1]
-        q = F.linear(q_x, self.qkv.weight[:c])
-        k, v = F.linear(kv_x, self.qkv.weight[c:]).chunk(2, dim=-1)
-        q = q.view(b, tq, self.h, -1).transpose(1, 2)
-        k = k.view(b, tk, self.h, -1).transpose(1, 2)
-        v = v.view(b, tk, self.h, -1).transpose(1, 2)
-        dev = q_x.device
-        q = self.rope.rotate(q, torch.arange(tk - tq, tk, device=dev))
-        k = self.rope.rotate(k, torch.arange(tk, device=dev))
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        return self.out(o.transpose(1, 2).reshape(b, tq, c))
-
 
 class Block(nn.Module):
     """Pre-norm transformer block: self-attention (masked) + MLP."""
@@ -122,13 +105,6 @@ class Block(nn.Module):
 
     def forward(self, x, mask):
         x = x + self.attn(self.ln1(x), mask)
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-    def forward_halo(self, q_x, kv_x, mask):
-        """Same block, but attention queries come from q_x and keys/values
-        from the wider window kv_x (shared projections, shared LN)."""
-        x = q_x + self.attn.forward_halo(self.ln1(q_x), self.ln1(kv_x), mask)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -516,23 +492,47 @@ class MGAModel(nn.Module):
 
     def _apply_block_halo(self, blk, s):
         """Halo smoothing: keys = previous block ++ current block (2b window).
-        Block 0 runs plain block-causal (no past exists)."""
+        The whole sequence is projected once, then sliced into windows. RoPE
+        uses global positions: attention scores depend only on relative
+        offsets, identical to per-window coordinates."""
         bs, t, c = s.shape
         b = self.b
         if t <= b:
             return blk(s, None)
-        xb = s.view(bs, -1, b, c)
-        first = blk(xb[:, 0], causal_mask(b, s.device)).unsqueeze(1)
-        if xb.shape[1] == 1:
-            return first.view(bs, t, c)
-        rest, prev = xb[:, 1:], xb[:, :-1]
-        kv = torch.cat([prev, rest], dim=2).reshape(bs * rest.shape[1], 2 * b, c)
-        q = rest.reshape(bs * rest.shape[1], b, c)
-        mask = halo_mask(b, s.device)
-        outs = [blk.forward_halo(qi, kvi, mask)
-                for qi, kvi in zip(q.split(FOLD_CHUNK), kv.split(FOLD_CHUNK))]
-        out = torch.cat(outs, dim=0)
-        return torch.cat([first, out.view(bs, -1, b, c)], dim=1).view(bs, t, c)
+        at = blk.attn
+        h, hd = at.h, c // at.h
+        q, k, v = at.qkv(blk.ln1(s)).chunk(3, dim=-1)
+        q = q.view(bs, t, h, hd).transpose(1, 2)  # (bs,h,t,hd)
+        k = k.view(bs, t, h, hd).transpose(1, 2)
+        v = v.view(bs, t, h, hd).transpose(1, 2)
+        pos = torch.arange(t, device=s.device)
+        q = at.rope.rotate(q, pos)
+        k = at.rope.rotate(k, pos)
+        q = q.transpose(1, 2).reshape(bs, -1, b, h, hd)  # (bs,nb,b,h,hd)
+        k = k.transpose(1, 2).reshape(bs, -1, b, h, hd)
+        v = v.transpose(1, 2).reshape(bs, -1, b, h, hd)
+        nb = q.shape[1]
+        # block 0: plain in-block causal (no past exists)
+        o0 = F.scaled_dot_product_attention(
+            q[:, 0].transpose(1, 2), k[:, 0].transpose(1, 2),
+            v[:, 0].transpose(1, 2), attn_mask=causal_mask(b, s.device))
+        parts = [o0.transpose(1, 2)]  # (bs,b,h,hd)
+        if nb > 1:
+            qw = q[:, 1:].reshape(bs * (nb - 1), b, h, hd).transpose(1, 2)
+            kw = torch.cat([k[:, :-1], k[:, 1:]], dim=2) \
+                    .reshape(bs * (nb - 1), 2 * b, h, hd).transpose(1, 2)
+            vw = torch.cat([v[:, :-1], v[:, 1:]], dim=2) \
+                    .reshape(bs * (nb - 1), 2 * b, h, hd).transpose(1, 2)
+            mask = halo_mask(b, s.device)
+            ow = [F.scaled_dot_product_attention(qi, ki, vi, attn_mask=mask)
+                  for qi, ki, vi in zip(qw.split(FOLD_CHUNK),
+                                        kw.split(FOLD_CHUNK),
+                                        vw.split(FOLD_CHUNK))]
+            parts.append(torch.cat(ow, dim=0).transpose(1, 2)
+                         .reshape(bs, nb - 1, b, h, hd).reshape(bs, -1, h, hd))
+        o = torch.cat(parts, dim=1).reshape(bs, t, c)
+        x = s + at.out(o)
+        return x + blk.mlp(blk.ln2(x))
 
     def _smooth(self, blk, s, shift=0):
         if self.halo:
