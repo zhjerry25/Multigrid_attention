@@ -426,6 +426,9 @@ class MGAModel(nn.Module):
         assert b % kq == 0, "kq must divide b"
         if read_mode == "amr":
             assert kq == 1 and not shift, "AMR read requires kq=1 and no shift"
+        if read_mode == "sparse":
+            assert kq == 1, "SparseRead currently requires kq=1"
+            assert not shift, "SparseRead currently requires shift=False"
         m, n_levels = n, 0
         while m > b:
             assert m % b == 0, f"sequence length {n} not coarsenable by b={b}"
