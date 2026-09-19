@@ -364,7 +364,8 @@ class SparseRead(nn.Module):
         # keys/values: null + summaries, block-representative scores
         kv = torch.cat([self.null.expand(bs, 1, d), summaries], dim=1)
         K, V = self.scorer.wkv(kv).chunk(2, dim=-1)  # (bs, ns+1, d)
-        q = self.scorer.wq(self.ln(x))  # (bs, n, d)
+        x_ln = self.ln(x)
+        q = self.scorer.wq(x_ln)  # (bs, n, d)
         qblk = q.view(bs, nb, b, d).mean(dim=2)  # (bs, nb, d) block rep
         # causal selection: block j's selection is computed from block j-1's
         # mean query (all <= j*b <= i). A within-block mean would leak future
@@ -392,22 +393,24 @@ class SparseRead(nn.Module):
         w = torch.softmax(att, dim=-1)
         ctx = torch.einsum("bqhzm,bqmhd->bqzhd", w, gVh).reshape(bs, n, d)
         # fine fanout: top-mf of the selection expand to their raw blocks.
-        # block_map: 0 = null block, 1+g = raw block g (matches idx: 0=null,
-        # s>=1 -> block s-1)
+        # map_K/map_V index: 0 = null block, 1+g = raw block g (matches idx:
+        # 0=null, s>=1 -> block s-1); fine KV are projected once, then gathered
         mf = min(self.mf, m)
         fidx = idx[:, :, :mf]  # (bs, nb, mf)
         fvalid = valid[:, :, :mf]  # blocks with <mf valid past summaries
         # may have selected masked (invalid) entries whose raw blocks could be
         # future blocks -- mask them out of the fine attention
         fmask = fvalid.unsqueeze(-1).expand(-1, -1, -1, b).reshape(bs, nb, mf * b)
-        block_map = torch.cat([self.null.expand(bs, b, d).unsqueeze(1),
-                               x.view(bs, nb, b, d)], dim=1)
-        fkeys = block_map[torch.arange(bs).view(bs, 1, 1), fidx]  # (bs,nb,mf,b,d)
-        fkeys = fkeys.reshape(bs, nb, mf * b, d)
-        fK, fV = self.fine.wkv(fkeys).chunk(2, dim=-1)
+        all_fK, all_fV = self.fine.wkv(x).chunk(2, dim=-1)
+        null_fK, null_fV = self.fine.wkv(self.null.expand(bs, b, d)).chunk(2, dim=-1)
+        map_K = torch.cat([null_fK.unsqueeze(1), all_fK.view(bs, nb, b, d)], dim=1)
+        map_V = torch.cat([null_fV.unsqueeze(1), all_fV.view(bs, nb, b, d)], dim=1)
+        rows = torch.arange(bs).view(bs, 1, 1)
+        fK = map_K[rows, fidx].reshape(bs, nb, mf * b, d)
+        fV = map_V[rows, fidx].reshape(bs, nb, mf * b, d)
         fKh = fK.view(bs, nb, mf * b, self.h, hd)
         fVh = fV.view(bs, nb, mf * b, self.h, hd)
-        qf = self.fine.wq(self.ln(x)).view(bs, nb, b, self.h, hd)
+        qf = self.fine.wq(x_ln).view(bs, nb, b, self.h, hd)
         fatt = torch.einsum("bqzhd,bqmhd->bqhzm", qf, fKh) / math.sqrt(hd)
         fatt = fatt.masked_fill(~fmask.unsqueeze(2).unsqueeze(2), float("-inf"))
         fw = torch.softmax(fatt, dim=-1)
