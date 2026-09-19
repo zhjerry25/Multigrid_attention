@@ -98,8 +98,8 @@ class Attn(nn.Module):
         positions 0..tk-1, queries at tk-tq..tk-1 (relative offsets exact)."""
         b, tq, c = q_x.shape
         tk = kv_x.shape[1]
-        q = self.qkv(q_x).chunk(3, dim=-1)[0]
-        k, v = self.qkv(kv_x).chunk(3, dim=-1)[1:]
+        q = F.linear(q_x, self.qkv.weight[:c])
+        k, v = F.linear(kv_x, self.qkv.weight[c:]).chunk(2, dim=-1)
         q = q.view(b, tq, self.h, -1).transpose(1, 2)
         k = k.view(b, tk, self.h, -1).transpose(1, 2)
         v = v.view(b, tk, self.h, -1).transpose(1, 2)
