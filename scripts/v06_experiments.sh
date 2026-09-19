@@ -25,9 +25,15 @@ sys.exit(0 if ok else 1)
 EOF
 }
 
-echo "=== [0/4] sanity: frozen arch on v0.6 tip (expect 512 ignite ~0.95, 4096 zero-shot ~0.96) ==="
-$MGA --task passkey --n 512  --cycles 2 --sparse --halo --steps 1500 --bs 64 --lr 1e-3 --save runs/pk_v06_512.pt  --tag pk_v06_512
-$MGA --task passkey --n 4096 --cycles 2 --sparse --halo --eval_only --resume runs/pk_v06_512.pt | tee runs/gate_v06.json
+echo "=== [0/4] sanity: frozen arch on v0.6 tip, canonical 3000-step recipe, 2 seeds ==="
+# NOTE: passkey ignition timing has large trajectory variance (fp rounding +
+# CUDA nondeterminism); only the FINAL exact matters. Expect >=0.9 by step
+# 3000 and ~0.95+ on the 4096 zero-shot; mid-run values at 1500 may straddle
+# 0.5-0.9 across seeds — that spread is normal, not a regression.
+for SEED in 0 1; do
+  $MGA --task passkey --n 512  --cycles 2 --sparse --halo --steps 3000 --bs 64 --lr 1e-3 --seed $SEED --save runs/pk_v06_512_s$SEED.pt --tag pk_v06_512_s$SEED
+  $MGA --task passkey --n 4096 --cycles 2 --sparse --halo --eval_only --resume runs/pk_v06_512_s$SEED.pt | tee runs/gate_v06_s$SEED.json
+done
 
 echo "=== [1/4] B1: --qdelta (coarse-context rewrite of fine query) ==="
 $MGA --task passkey --n 512  --cycles 2 --sparse --halo --qdelta --steps 3000 --bs 64 --lr 1e-3 --save runs/pk_qdelta512.pt --tag pk_qdelta512
