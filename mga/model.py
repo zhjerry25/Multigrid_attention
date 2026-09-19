@@ -355,6 +355,9 @@ class SparseRead(nn.Module):
         self.scorer = CrossAttn(d, h)
         self.fine = CrossAttn(d, h)
         self.null = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        self._diag = False
+        self._idx_hist = []
+        self.diag_stats = {}
         if qdelta:
             self.q_delta = nn.Linear(d, d, bias=False)
             nn.init.zeros_(self.q_delta.weight)
@@ -418,23 +421,54 @@ class SparseRead(nn.Module):
         fVh = fV.view(bs, nb, mf * b, self.h, hd)
         qf = self.fine.wq(x_ln)
         if self.q_delta is not None:
-            qf = qf + self.coarse_gate * self.q_delta(self.ln(ctx))
+            dq = self.coarse_gate * self.q_delta(self.ln(ctx))
+            if self._diag:
+                self.diag_stats["dqn"] = round(float(
+                    dq.norm() / qf.norm().clamp_min(1e-9)), 4)
+            qf = qf + dq
         qf = qf.view(bs, nb, b, self.h, hd)
         fatt = torch.einsum("bqzhd,bqmhd->bqhzm", qf, fKh) / math.sqrt(hd)
         fatt = fatt.masked_fill(~fmask.unsqueeze(2).unsqueeze(2), float("-inf"))
         fw = torch.softmax(fatt, dim=-1)
         fctx = torch.einsum("bqhzm,bqmhd->bqzhd", fw, fVh).reshape(bs, n, d)
+        if self._diag:
+            self._idx_hist.append(idx.detach())
+            fwc = fw.clamp_min(1e-9)
+            self.diag_stats["fine_ent"] = round(float(
+                -(fwc * fwc.log()).sum(-1).mean()), 4)
+            self.diag_stats["fine_top1"] = round(float(
+                fw.max(-1).values.mean()), 4)
         return x + self.fine.out(ctx + fctx)
+
+
+class CycleModules(nn.Module):
+    """One V-cycle's complete operator set (shared across levels within the
+    cycle, mirroring the frozen shared structure)."""
+
+    def __init__(self, d, h, rope, kq, fp32read, read_mode, read_m, read_mf,
+                 qdelta):
+        super().__init__()
+        assert read_mode in ("dense", "sparse"), "CycleModules: dense or sparse only"
+        self.block = Block(d, h, rope)   # smooth/post/top roles (mirrors shared)
+        self.pool = Pool(d, h, kq, fp32read)
+        self.read = Read(d, h, fp32read)
+        self.sparseread = (SparseRead(d, h, m=read_m, mf=read_mf, qdelta=qdelta)
+                           if read_mode == "sparse" else None)
 
 
 class MGAModel(nn.Module):
     def __init__(self, vocab, n, d=256, h=4, b=16, kq=1, cycles=2, shared=True,
                  posxattn=False, shift=False, fp32read=False, poolaux=False,
                  read_mode="dense", amr_m=4, read_m=64, read_mf=4, halo=False,
-                 qdelta=False, split_roles=False):
+                 qdelta=False, split_roles=False, cycle_unshared=False,
+                 cycle_gate=False):
         super().__init__()
         assert b % kq == 0, "kq must divide b"
         assert shared or not split_roles, "split_roles requires shared=True"
+        assert shared or not cycle_unshared, \
+            "cycle_unshared mirrors the shared structure"
+        assert read_mode != "amr" or not cycle_unshared, \
+            "cycle_unshared + amr unsupported"
         if read_mode == "amr":
             assert kq == 1 and not shift, "AMR read requires kq=1 and no shift"
         if read_mode == "sparse":
@@ -450,6 +484,10 @@ class MGAModel(nn.Module):
         assert not (halo and shift), "halo + shift unsupported"
         self.b, self.kq, self.cycles, self.shared = b, kq, cycles, shared
         self.split_roles = split_roles
+        self.cycle_unshared = cycle_unshared
+        self.cgate = nn.Parameter(torch.ones(cycles)) if cycle_gate else None
+        self._diag = False
+        self.diag_dnorm = []
         self.posxattn, self.shift = posxattn, (b // 2 if shift else 0)
         self.poolaux = poolaux
         self.read_mode = read_mode
@@ -464,9 +502,13 @@ class MGAModel(nn.Module):
             self.poolaux_head = nn.Linear(d, vocab)
         if read_mode == "amr":
             self.amrread = AMRRead(d, h, m=amr_m)
-        elif read_mode == "sparse":
+        elif read_mode == "sparse" and not cycle_unshared:
             self.sparseread = SparseRead(d, h, m=read_m, mf=read_mf, qdelta=qdelta)
-        if shared:
+        if cycle_unshared:
+            self.cycles_mod = nn.ModuleList(
+                CycleModules(d, h, self.rope, kq, fp32read, read_mode,
+                             read_m, read_mf, qdelta) for _ in range(cycles))
+        elif shared:
             if split_roles:
                 self.pre_block = Block(d, h, self.rope)
                 self.post_block = Block(d, h, self.rope)
@@ -587,30 +629,31 @@ class MGAModel(nn.Module):
         return F.binary_cross_entropy_with_logits(self.poolaux_head(summaries),
                                                   multi)
 
-    def _vcycle(self, s0, shift=0, idx=None):
+    def _vcycle(self, s0, shift=0, idx=None, mods=None):
         b = self.b
         rope = self.rope if self.posxattn else None
         hier, covers, auxes = [s0], [], []
         s, l = s0, 0
         while s.shape[1] > b:
             sh = shift if l == 0 else 0
-            s = self._smooth(self._role("smooth", l), s, sh)
-            s, cover_end = self._role("pool", l)(s, b, rope=rope, shift=sh)
+            s = self._smooth(self._role("smooth", l, mods), s, sh)
+            s, cover_end = self._role("pool", l, mods)(s, b, rope=rope, shift=sh)
             if l == 0 and idx is not None:
                 auxes.append(self._bow_aux(s, cover_end, idx))
             hier.append(s)
             covers.append(cover_end)
             l += 1
-        hier[-1] = self._role("top", 0)(hier[-1], None)
+        hier[-1] = self._role("top", 0, mods)(hier[-1], None)
         for l in reversed(range(len(hier) - 1)):
             if l == 0 and self.read_mode == "amr":
                 hier[0] = self.amrread(hier[0], hier[1:], covers)
             elif l == 0 and self.read_mode == "sparse":
-                hier[0] = self.sparseread(hier[0], hier[1], covers[0])
+                sr = mods.sparseread if mods is not None else self.sparseread
+                hier[0] = sr(hier[0], hier[1], covers[0])
             else:
-                hier[l] = self._role("read", l)(hier[l], hier[l + 1],
-                                                covers[l], rope=rope)
-            hier[l] = self._smooth(self._role("post", l), hier[l],
+                hier[l] = self._role("read", l, mods)(hier[l], hier[l + 1],
+                                                      covers[l], rope=rope)
+            hier[l] = self._smooth(self._role("post", l, mods), hier[l],
                                    shift if l == 0 else 0)
         return hier[0], auxes
 
@@ -618,9 +661,16 @@ class MGAModel(nn.Module):
         s = self.emb(idx)
         outs, auxes = [], []
         for t in range(self.cycles):
-            s, aux = self._vcycle(s, shift=self.shift if t % 2 == 1 else 0,
-                                  idx=idx if self.poolaux else None)
+            mods = self.cycles_mod[t] if self.cycle_unshared else None
+            s_new, aux = self._vcycle(s, shift=self.shift if t % 2 == 1 else 0,
+                                      idx=idx if self.poolaux else None,
+                                      mods=mods)
             auxes.extend(aux)
+            if self._diag:
+                self.diag_dnorm.append(
+                    float((s_new - s).norm() / s.norm().clamp_min(1e-9)))
+            s = (s + self.cgate[t] * (s_new - s) if self.cgate is not None
+                 else s_new)
             if all_cycles or t == self.cycles - 1:
                 outs.append(self.head(self.lnf(s)))
         res = outs if all_cycles else outs[-1]

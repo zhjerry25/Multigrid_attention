@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from . import data
 from . import lmdata
-from .model import MGAModel, BaselineModel
+from .model import MGAModel, BaselineModel, SparseRead
 
 VOCABS = {"passkey": data.VOCAB, "copying": data.VOCAB, "mqar": data.VOCAB,
           "lm": 256}
@@ -62,7 +62,9 @@ def build(args, n=None, d=None, device="cpu"):
                      read_mf=getattr(args, "read_mf", 4),
                      halo=getattr(args, "halo", False),
                      qdelta=getattr(args, "qdelta", False),
-                     split_roles=getattr(args, "split_roles", False))
+                     split_roles=getattr(args, "split_roles", False),
+                     cycle_unshared=getattr(args, "cycle_unshared", False),
+                     cycle_gate=getattr(args, "cycle_gate", False))
     else:
         m = BaselineModel(vocab, n, mode=args.model, d=d, h=args.heads,
                           depth=args.depth, window=args.b)
@@ -133,6 +135,52 @@ def save_ckpt(path, model, opt, ema, args, step):
                 "ema": ema, "args": vars(args), "step": step}, path)
 
 
+def diag_pass(model, args, g_eval, device):
+    """B3 --diag: one no-grad val forward collecting per-cycle state norms,
+    SparseRead selection overlap / fine-attention stats / qdelta gate, and
+    (split_roles) per-role gradient norms from one grad-enabled pass."""
+    model._diag = True
+    model.diag_dnorm = []
+    srs = [m for m in model.modules() if isinstance(m, SparseRead)]
+    for sr in srs:
+        sr._diag = True
+        sr._idx_hist = []
+        sr.diag_stats = {}
+    idx, tgt, mask, _ = make_batch(args, g_eval, device, split="val")
+    with torch.no_grad(), amp_ctx(args, device):
+        model(idx)
+    diag = {"cycle_dnorm": [round(x, 4) for x in model.diag_dnorm]}
+    # selection overlap between the first two recorded top-m selections
+    # (shared read: cycle 0 vs cycle 1; cycle_unshared: cycles_mod[0] vs [1])
+    hist = [e for sr in srs for e in sr._idx_hist]
+    if len(hist) >= 2:
+        a, b = hist[0], hist[1]
+        diag["sel_overlap"] = round(float(
+            (a.unsqueeze(-1) == b.unsqueeze(-2)).any(-1).float().mean()), 4)
+    if srs and getattr(srs[0], "q_delta", None) is not None:
+        diag["qgate"] = round(float(srs[0].coarse_gate.abs()), 4)
+        diag.update(srs[0].diag_stats)
+    model._diag = False
+    for sr in srs:
+        sr._diag = False
+    if getattr(model, "split_roles", False):
+        model.train()
+        with torch.enable_grad(), amp_ctx(args, device):
+            lgs = model(idx)
+            lgs = lgs[0] if isinstance(lgs, tuple) else lgs
+            loss = F.cross_entropy(lgs.reshape(-1, lgs.shape[-1]),
+                                   tgt.reshape(-1))
+            loss.backward()
+        gn = torch.cat([p.grad.reshape(-1)
+                        for blk in (model.pre_block, model.post_block,
+                                    model.top_block)
+                        for p in blk.parameters()]).norm()
+        diag["role_gnorm"] = round(float(gn), 3)
+        model.zero_grad(set_to_none=True)
+        model.eval()
+    return diag
+
+
 def leak_test():
     """Shuffle the last 10% of input tokens; logits over the first 90% must
     not change. Run on CPU for determinism. Covers shift/kq>1/posxattn too --
@@ -150,6 +198,8 @@ def leak_test():
         ("mga_halo", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True)),
         ("mga_qdelta", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True, qdelta=True)),
         ("mga_roles", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True, split_roles=True)),
+        ("mga_cycu", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True, cycle_unshared=True)),
+        ("mga_cycgate", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True, cycle_gate=True)),
         ("full", dict(model="full", k=1, shift=False, posxattn=False)),
         ("local", dict(model="local", k=1, shift=False, posxattn=False)),
     ]
@@ -286,6 +336,8 @@ def train(args, device):
                       .all(1).float().mean().item(), 3)
                 for lg in lgs
             ]
+        if getattr(args, "diag", False) and args.model == "mga":
+            rec["diag"] = diag_pass(model, args, g_eval, device)
         print(json.dumps(rec), flush=True)
         return
     g_train = torch.Generator().manual_seed(args.seed + 100)
@@ -441,6 +493,14 @@ def main():
                     help="v0.6 B1: coarse-to-fine query delta (zero-init gate)")
     ap.add_argument("--split_roles", action="store_true",
                     help="v0.6 B2: split shared block into pre/post/top roles")
+    ap.add_argument("--cycle_unshared", action="store_true",
+                    help="v0.6 B3: per-cycle module sets (mirrors shared "
+                         "structure; cycles x params)")
+    ap.add_argument("--cycle_gate", action="store_true",
+                    help="v0.6 B3: learned per-cycle residual gate (init 1)")
+    ap.add_argument("--diag", action="store_true",
+                    help="v0.6 B3: with --eval_only, run diagnostics pass into "
+                         "rec['diag']")
     ap.add_argument("--resume_weights_only", default="",
                     help="lenient weight resume (fresh opt/schedule, step 0)")
     ap.add_argument("--tag", default=None)
