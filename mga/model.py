@@ -588,7 +588,8 @@ class MGAModel(nn.Module):
             s, aux = self._vcycle(s, shift=self.shift if t % 2 == 1 else 0,
                                   idx=idx if self.poolaux else None)
             auxes.extend(aux)
-            outs.append(self.head(self.lnf(s)))
+            if all_cycles or t == self.cycles - 1:
+                outs.append(self.head(self.lnf(s)))
         res = outs if all_cycles else outs[-1]
         if self.poolaux:
             return res, (torch.stack(auxes).mean() if auxes else s.sum() * 0.0)
