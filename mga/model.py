@@ -431,9 +431,10 @@ class MGAModel(nn.Module):
     def __init__(self, vocab, n, d=256, h=4, b=16, kq=1, cycles=2, shared=True,
                  posxattn=False, shift=False, fp32read=False, poolaux=False,
                  read_mode="dense", amr_m=4, read_m=64, read_mf=4, halo=False,
-                 qdelta=False):
+                 qdelta=False, split_roles=False):
         super().__init__()
         assert b % kq == 0, "kq must divide b"
+        assert shared or not split_roles, "split_roles requires shared=True"
         if read_mode == "amr":
             assert kq == 1 and not shift, "AMR read requires kq=1 and no shift"
         if read_mode == "sparse":
@@ -448,6 +449,7 @@ class MGAModel(nn.Module):
             assert n_levels >= 2, f"AMR read needs >=2 summary levels (n={n} too small)"
         assert not (halo and shift), "halo + shift unsupported"
         self.b, self.kq, self.cycles, self.shared = b, kq, cycles, shared
+        self.split_roles = split_roles
         self.posxattn, self.shift = posxattn, (b // 2 if shift else 0)
         self.poolaux = poolaux
         self.read_mode = read_mode
@@ -465,7 +467,12 @@ class MGAModel(nn.Module):
         elif read_mode == "sparse":
             self.sparseread = SparseRead(d, h, m=read_m, mf=read_mf, qdelta=qdelta)
         if shared:
-            self.block = Block(d, h, self.rope)
+            if split_roles:
+                self.pre_block = Block(d, h, self.rope)
+                self.post_block = Block(d, h, self.rope)
+                self.top_block = Block(d, h, self.rope)
+            else:
+                self.block = Block(d, h, self.rope)
             self.pool = Pool(d, h, kq, fp32read)
             self.read = Read(d, h, fp32read)
         else:
@@ -484,6 +491,16 @@ class MGAModel(nn.Module):
             return {"smooth": self.block, "post": self.block, "top": self.block,
                     "pool": self.pool, "read": self.read}[name.split("_")[0]]
         return self.mods[name]
+
+    def _role(self, role, l, mods=None):
+        if mods is not None:
+            return {"smooth": mods.block, "post": mods.block, "top": mods.block,
+                    "pool": mods.pool, "read": mods.read}[role]
+        if self.split_roles and self.shared:
+            return {"smooth": self.pre_block, "post": self.post_block,
+                    "top": self.top_block, "pool": self.pool,
+                    "read": self.read}[role]
+        return self._get("top") if role == "top" else self._get(f"{role}_{l}")
 
     def _apply_block(self, blk, s, shift=0):
         """Block-causal smoothing. Full blocks fold into batch (chunked);
@@ -577,23 +594,23 @@ class MGAModel(nn.Module):
         s, l = s0, 0
         while s.shape[1] > b:
             sh = shift if l == 0 else 0
-            s = self._smooth(self._get(f"smooth_{l}"), s, sh)
-            s, cover_end = self._get(f"pool_{l}")(s, b, rope=rope, shift=sh)
+            s = self._smooth(self._role("smooth", l), s, sh)
+            s, cover_end = self._role("pool", l)(s, b, rope=rope, shift=sh)
             if l == 0 and idx is not None:
                 auxes.append(self._bow_aux(s, cover_end, idx))
             hier.append(s)
             covers.append(cover_end)
             l += 1
-        hier[-1] = self._get("top")(hier[-1], None)
+        hier[-1] = self._role("top", 0)(hier[-1], None)
         for l in reversed(range(len(hier) - 1)):
             if l == 0 and self.read_mode == "amr":
                 hier[0] = self.amrread(hier[0], hier[1:], covers)
             elif l == 0 and self.read_mode == "sparse":
                 hier[0] = self.sparseread(hier[0], hier[1], covers[0])
             else:
-                hier[l] = self._get(f"read_{l}")(hier[l], hier[l + 1],
+                hier[l] = self._role("read", l)(hier[l], hier[l + 1],
                                                 covers[l], rope=rope)
-            hier[l] = self._smooth(self._get(f"post_{l}"), hier[l],
+            hier[l] = self._smooth(self._role("post", l), hier[l],
                                    shift if l == 0 else 0)
         return hier[0], auxes
 

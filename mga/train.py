@@ -61,7 +61,8 @@ def build(args, n=None, d=None, device="cpu"):
                      read_m=getattr(args, "read_m", 64),
                      read_mf=getattr(args, "read_mf", 4),
                      halo=getattr(args, "halo", False),
-                     qdelta=getattr(args, "qdelta", False))
+                     qdelta=getattr(args, "qdelta", False),
+                     split_roles=getattr(args, "split_roles", False))
     else:
         m = BaselineModel(vocab, n, mode=args.model, d=d, h=args.heads,
                           depth=args.depth, window=args.b)
@@ -148,6 +149,7 @@ def leak_test():
         ("mga_sparse", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True)),
         ("mga_halo", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True)),
         ("mga_qdelta", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True, qdelta=True)),
+        ("mga_roles", dict(model="mga", k=1, shift=False, posxattn=False, sparse=True, halo=True, split_roles=True)),
         ("full", dict(model="full", k=1, shift=False, posxattn=False)),
         ("local", dict(model="local", k=1, shift=False, posxattn=False)),
     ]
@@ -437,6 +439,8 @@ def main():
                     help="v0.4: halo smoothing (prev-block ++ cur-block keys, 2b window)")
     ap.add_argument("--qdelta", action="store_true",
                     help="v0.6 B1: coarse-to-fine query delta (zero-init gate)")
+    ap.add_argument("--split_roles", action="store_true",
+                    help="v0.6 B2: split shared block into pre/post/top roles")
     ap.add_argument("--resume_weights_only", default="",
                     help="lenient weight resume (fresh opt/schedule, step 0)")
     ap.add_argument("--tag", default=None)
